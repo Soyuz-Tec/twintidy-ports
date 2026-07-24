@@ -1,0 +1,13 @@
+[package]
+name = "twintidy"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of TwinTidy's duplicate-detection core (read-only CLI)"
+license = "MIT"
+repository = "https://github.com/Soyuz-Tec/twintidy-ports"
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true
