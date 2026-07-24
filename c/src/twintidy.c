@@ -16,6 +16,12 @@
  *   twintidy <folder>
  */
 
+/* Expose POSIX declarations (strdup, lstat) under strict -std=c11 on
+ * glibc; without this they are implicitly declared and the returned
+ * pointer from strdup is truncated to int, crashing on 64-bit Linux. */
+#define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 700
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
