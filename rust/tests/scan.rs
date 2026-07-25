@@ -54,8 +54,10 @@ fn finds_exact_duplicates_with_different_names() {
     fixture.write("copies/renamed.txt", &content);
     fixture.write("docs/unique.txt", &payload(9, 9000));
 
-    let result = scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("scan succeeds");
+    let result = scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("scan succeeds");
 
     assert_eq!(result.groups.len(), 1, "expected one duplicate group");
     assert_eq!(result.groups[0].files.len(), 2);
@@ -73,8 +75,10 @@ fn same_size_different_content_is_not_a_duplicate() {
     fixture.write("a.txt", &payload(1, 5000));
     fixture.write("b.txt", &payload(2, 5000));
 
-    let result = scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("scan succeeds");
+    let result = scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("scan succeeds");
     assert!(result.groups.is_empty());
 }
 
@@ -92,14 +96,22 @@ fn protected_directories_and_extensions_are_excluded() {
     fixture.write("docs/keep1.txt", &keep);
     fixture.write("docs/keep2.txt", &keep);
 
-    let result = scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("scan succeeds");
+    let result = scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("scan succeeds");
 
     assert_eq!(result.groups.len(), 1, "only the .txt pair may be reported");
     for file in &result.groups[0].files {
         let text = file.path.to_string_lossy();
-        assert!(!text.contains("node_modules"), "node_modules leaked: {text}");
-        assert!(!text.ends_with(".exe"), "protected extension leaked: {text}");
+        assert!(
+            !text.contains("node_modules"),
+            "node_modules leaked: {text}"
+        );
+        assert!(
+            !text.ends_with(".exe"),
+            "protected extension leaked: {text}"
+        );
     }
 }
 
@@ -110,8 +122,10 @@ fn surface_scan_reports_category_statistics() {
     fixture.write("b.pdf", &payload(2, 200));
     fixture.write("c.jpg", &payload(3, 300));
 
-    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("surface scan succeeds");
+    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("surface scan succeeds");
 
     assert_eq!(surface.files.len(), 3);
     assert_eq!(surface.total_bytes, 600);
@@ -131,8 +145,10 @@ fn category_filter_restricts_duplicate_matching() {
     fixture.write("a.png", &image);
     fixture.write("b.png", &image);
 
-    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("surface scan succeeds");
+    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("surface scan succeeds");
 
     let images_only = Options {
         categories: vec![Category::Images],
@@ -158,8 +174,10 @@ fn min_size_and_extension_filters_apply() {
     fixture.write("big1.log", &big);
     fixture.write("big2.log", &big);
 
-    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("surface scan succeeds");
+    let surface = surface_scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("surface scan succeeds");
 
     // The size floor removes the small pair.
     let floored = Options {
@@ -210,8 +228,10 @@ fn group_hash_is_the_sha256_of_the_content() {
     fixture.write("a.txt", b"abc");
     fixture.write("b.txt", b"abc");
 
-    let result = scan(fixture.path(), &Options::default(), |_, _, _| Flow::Continue)
-        .expect("scan succeeds");
+    let result = scan(fixture.path(), &Options::default(), |_, _, _| {
+        Flow::Continue
+    })
+    .expect("scan succeeds");
 
     assert_eq!(result.groups.len(), 1);
     assert_eq!(
