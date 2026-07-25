@@ -20,10 +20,11 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-      - name: Build CLI and smoke-test
+      - name: Build CLI, unit-test, and smoke-test
         working-directory: c
         run: |
           make cli
+          make unit-test
           make test
       # The GUI is Windows-only; `make gui` is a no-op elsewhere.
       - name: Build GUI

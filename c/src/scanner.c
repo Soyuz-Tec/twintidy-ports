@@ -211,8 +211,57 @@ static int inventory_add(inventory *inv, const char *path, uint64_t size,
     return 1;
 }
 
-static int walk(const char *dir, inventory *inv, td_surface *report_out,
-                const td_options *options, progress_sink *sink) {
+/*
+ * Directories still to visit. Traversal uses this explicit stack rather than
+ * recursion: a deeply nested tree — which a scan target may legitimately be,
+ * and which a hostile one certainly can be — would otherwise exhaust the
+ * call stack before any cardinality limit was reached.
+ */
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} pending_dirs;
+
+static int pending_push(pending_dirs *pending, const char *path) {
+    if (pending->count == pending->capacity) {
+        size_t capacity = pending->capacity ? pending->capacity * 2 : 64;
+        char **grown = realloc(pending->items, capacity * sizeof *grown);
+        if (grown == NULL) {
+            return 0;
+        }
+        pending->items = grown;
+        pending->capacity = capacity;
+    }
+    char *copy = strdup(path);
+    if (copy == NULL) {
+        return 0;
+    }
+    pending->items[pending->count++] = copy;
+    return 1;
+}
+
+static char *pending_pop(pending_dirs *pending) {
+    if (pending->count == 0) {
+        return NULL;
+    }
+    return pending->items[--pending->count];
+}
+
+static void pending_free(pending_dirs *pending) {
+    for (size_t i = 0; i < pending->count; i++) {
+        free(pending->items[i]);
+    }
+    free(pending->items);
+    pending->items = NULL;
+    pending->count = 0;
+    pending->capacity = 0;
+}
+
+/* Read one directory, queueing any subdirectories onto `pending`. */
+static int read_directory(const char *dir, inventory *inv, td_surface *report_out,
+                          const td_options *options, progress_sink *sink,
+                          pending_dirs *pending) {
     if (report_out->directories_scanned >= option_max_directories(options)) {
         return TD_ERR_LIMIT;
     }
@@ -266,8 +315,8 @@ static int walk(const char *dir, inventory *inv, td_surface *report_out,
         if (S_ISDIR(info.st_mode)) {
             if (td_should_skip_directory(path)) {
                 report_out->skipped_system_items++;
-            } else {
-                status = walk(path, inv, report_out, options, sink);
+            } else if (!pending_push(pending, path)) {
+                status = TD_ERR_MEMORY;
             }
         } else if (S_ISREG(info.st_mode)) {
             if (!td_is_user_created_file(path)) {
@@ -292,6 +341,27 @@ static int walk(const char *dir, inventory *inv, td_surface *report_out,
         }
     }
     closedir(handle);
+    return status;
+}
+
+/* Traverse `root` iteratively, draining the pending-directory stack. */
+static int walk(const char *root, inventory *inv, td_surface *report_out,
+                const td_options *options, progress_sink *sink) {
+    pending_dirs pending = {NULL, 0, 0};
+    if (!pending_push(&pending, root)) {
+        return TD_ERR_MEMORY;
+    }
+
+    int status = TD_OK;
+    char *dir;
+    while ((dir = pending_pop(&pending)) != NULL) {
+        status = read_directory(dir, inv, report_out, options, sink, &pending);
+        free(dir);
+        if (status != TD_OK) {
+            break;
+        }
+    }
+    pending_free(&pending);
     return status;
 }
 
@@ -593,11 +663,19 @@ int td_find_duplicates(const td_surface *surface, const td_options *options,
             if (!candidates[i].hashed || candidates[i].claimed) {
                 continue;
             }
-            size_t members[256];
+            /* Sized to the whole size group. A fixed cap would silently split
+             * one large duplicate group into several, which misreports the
+             * relationship and skews the reclaimable estimate by one file for
+             * every spurious extra group. */
+            size_t *members = calloc(end - start, sizeof *members);
+            if (members == NULL) {
+                status = TD_ERR_MEMORY;
+                break;
+            }
             size_t member_count = 0;
             members[member_count++] = i;
 
-            for (size_t j = i + 1; j < end && member_count < 256; j++) {
+            for (size_t j = i + 1; j < end; j++) {
                 if (!candidates[j].hashed || candidates[j].claimed) {
                     continue;
                 }
@@ -621,11 +699,13 @@ int td_find_duplicates(const td_surface *surface, const td_options *options,
                         free(group.files[m].path);
                     }
                     free(group.files);
+                    free(members);
                     status = TD_ERR_MEMORY;
                     break;
                 }
                 out->reclaimable += group.size * (uint64_t)(member_count - 1);
             }
+            free(members);
         }
         start = end;
     }
