@@ -27,7 +27,7 @@ mod windows_gui {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    use twintidy::{format_bytes, scan, Flow, ScanResult};
+    use twintidy::{format_bytes, scan, Flow, Options, ScanResult, Stage};
 
     use windows_sys::core::{w, PCWSTR};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -435,33 +435,38 @@ mod windows_gui {
         let main = state.main as isize;
         std::thread::spawn(move || {
             let mut last_posted = 0usize;
-            let outcome = scan(&root, |stage, done, total| {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Flow::Cancel;
-                }
-                // Throttle: posting for every file would flood the queue.
-                if done != 0 && done - last_posted < 64 && done != total {
-                    return Flow::Continue;
-                }
-                last_posted = done;
-                let message = Box::new(ProgressMessage {
-                    stage: stage.label(),
-                    done,
-                    total,
-                });
-                unsafe {
-                    if PostMessageW(
-                        main as HWND,
-                        WM_APP_PROGRESS,
-                        0,
-                        Box::into_raw(message) as isize,
-                    ) == 0
-                    {
-                        // Window is gone; nothing to leak into.
+            let options = Options::default();
+            let outcome = scan(
+                &root,
+                &options,
+                |stage: Stage, done: usize, total: usize| {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return Flow::Cancel;
                     }
-                }
-                Flow::Continue
-            });
+                    // Throttle: posting for every file would flood the queue.
+                    if done != 0 && done - last_posted < 64 && done != total {
+                        return Flow::Continue;
+                    }
+                    last_posted = done;
+                    let message = Box::new(ProgressMessage {
+                        stage: stage.label(),
+                        done,
+                        total,
+                    });
+                    unsafe {
+                        if PostMessageW(
+                            main as HWND,
+                            WM_APP_PROGRESS,
+                            0,
+                            Box::into_raw(message) as isize,
+                        ) == 0
+                        {
+                            // Window is gone; nothing to leak into.
+                        }
+                    }
+                    Flow::Continue
+                },
+            );
 
             let payload: isize = match outcome {
                 Ok(result) => Box::into_raw(Box::new(result)) as isize,
@@ -559,7 +564,7 @@ mod windows_gui {
         let summary = if result.groups.is_empty() {
             format!(
                 "No duplicates found among {} scanned file(s).",
-                result.files_scanned
+                result.files_considered
             )
         } else {
             format!(

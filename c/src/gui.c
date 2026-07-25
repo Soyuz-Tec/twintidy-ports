@@ -204,7 +204,8 @@ static DWORD WINAPI scan_thread(LPVOID parameter) {
     td_result *result = calloc(1, sizeof *result);
     int status = TD_ERR_MEMORY;
     if (result != NULL) {
-        status = td_scan(root, result, worker_progress, NULL);
+        td_options options = td_default_options();
+        status = td_scan(root, &options, result, worker_progress, NULL);
     }
     free(root);
 
@@ -340,7 +341,7 @@ static void on_finished(int status, td_result *result) {
     if (result->count == 0) {
         _snwprintf(text, sizeof text / sizeof *text,
                    L"No duplicates found among %zu scanned file(s).",
-                   result->files_scanned);
+                   result->files_considered);
     } else {
         _snwprintf(text, sizeof text / sizeof *text,
                    L"%zu duplicate group(s) across %zu file(s). Keeping one copy of each would reclaim %s.",
