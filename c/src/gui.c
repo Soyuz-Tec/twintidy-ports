@@ -14,6 +14,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601
+/* COBJMACROS provides the C-callable IShellItemImageFactory_* helpers. */
+#define COBJMACROS
 
 #include "report.h"
 #include "scanner.h"
@@ -26,9 +28,16 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Preview limits. The text preview is deliberately bounded: it exists to
+ * identify a file, not to display it, and an unbounded read of an arbitrary
+ * file would be both slow and pointless in a small pane. */
+#define PREVIEW_TEXT_BYTES 4096
+#define PREVIEW_THUMBNAIL_EDGE 220
 
 #define ID_SELECT_FOLDER 1001
 #define ID_SURFACE_SCAN  1002
@@ -76,6 +85,8 @@ typedef struct {
     HWND clear_results_button, reset_button, about_button, preview_safety_button;
     HWND list, progress, status, path_label, stage_label, elapsed_label, focus_label;
     HWND files_label, current_label;
+    HWND preview_image, preview_text;
+    HBITMAP preview_bitmap;
     HWND category_checks[TD_CATEGORY_COUNT];
     HFONT font;
 
@@ -183,6 +194,155 @@ static void format_local_time(int64_t seconds, wchar_t *out, size_t count) {
 
 static void set_status(const wchar_t *text) { SetWindowTextW(app.status, text); }
 
+/* ---------- preview ---------- */
+
+static void clear_preview_bitmap(void) {
+    if (app.preview_bitmap != NULL) {
+        SendMessageW(app.preview_image, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)NULL);
+        DeleteObject(app.preview_bitmap);
+        app.preview_bitmap = NULL;
+    }
+}
+
+/*
+ * Ask the Windows Shell for an existing thumbnail of `path`.
+ *
+ * The Shell renders the image in its own process using the handler already
+ * registered for that file type; this application never parses, decodes, or
+ * executes the file's contents. SIIGBF_THUMBNAILONLY means a generic type
+ * icon is refused, so an empty pane honestly signals "no thumbnail" rather
+ * than showing a placeholder that looks like content.
+ */
+static HBITMAP load_shell_thumbnail(const wchar_t *path, int edge) {
+    /* Defined locally rather than linked from libuuid: not every MinGW-w64
+     * distribution exports this comparatively recent interface's IID, and a
+     * missing symbol would break the build on some toolchains. */
+    static const GUID iid_shell_item_image_factory = {
+        0xbcc18b79, 0xba16, 0x442f, {0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b}};
+
+    IShellItemImageFactory *factory = NULL;
+    HRESULT hr = SHCreateItemFromParsingName(path, NULL, &iid_shell_item_image_factory,
+                                             (void **)&factory);
+    if (FAILED(hr) || factory == NULL) {
+        return NULL;
+    }
+    SIZE size;
+    size.cx = edge;
+    size.cy = edge;
+    HBITMAP bitmap = NULL;
+    hr = IShellItemImageFactory_GetImage(factory, size, SIIGBF_THUMBNAILONLY, &bitmap);
+    IShellItemImageFactory_Release(factory);
+    return SUCCEEDED(hr) ? bitmap : NULL;
+}
+
+/*
+ * Read a bounded prefix of a file and render it as text. Bytes are shown
+ * as-is with control characters neutralized; nothing is interpreted as
+ * markup, script, or a document format.
+ */
+static wchar_t *load_text_preview(const wchar_t *path) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    unsigned char raw[PREVIEW_TEXT_BYTES];
+    DWORD read = 0;
+    BOOL ok = ReadFile(file, raw, sizeof raw, &read, NULL);
+    CloseHandle(file);
+    if (!ok || read == 0) {
+        return NULL;
+    }
+
+    /* Reject binary content: a NUL byte in the prefix means this is not
+     * text, and showing mojibake would be worse than showing nothing. */
+    for (DWORD i = 0; i < read; i++) {
+        if (raw[i] == 0) {
+            return NULL;
+        }
+    }
+    for (DWORD i = 0; i < read; i++) {
+        if (raw[i] < 0x20 && raw[i] != '\r' && raw[i] != '\n' && raw[i] != '\t') {
+            raw[i] = '.';
+        }
+    }
+
+    wchar_t *text = calloc((size_t)read + 1, sizeof *text);
+    if (text == NULL) {
+        return NULL;
+    }
+    int converted = MultiByteToWideChar(CP_UTF8, 0, (const char *)raw, (int)read, text, (int)read);
+    if (converted <= 0) {
+        converted = MultiByteToWideChar(CP_ACP, 0, (const char *)raw, (int)read, text, (int)read);
+    }
+    if (converted <= 0) {
+        free(text);
+        return NULL;
+    }
+    text[converted] = L'\0';
+    return text;
+}
+
+/* Refresh the preview pane for the currently focused row. */
+static void update_preview(void) {
+    clear_preview_bitmap();
+    int index = ListView_GetNextItem(app.list, -1, LVNI_SELECTED);
+    if (index < 0 || (size_t)index >= app.row_count) {
+        SetWindowTextW(app.preview_text,
+                       L"Select a row to see its details.\r\n\r\n"
+                       L"Thumbnails are produced by Windows Explorer's own preview "
+                       L"handlers. This window never parses or renders file contents.");
+        return;
+    }
+
+    const row *entry = &app.rows[index];
+    wchar_t path[MAX_PATH * 2];
+    _snwprintf(path, sizeof path / sizeof *path, L"%s\\%s", entry->folder, entry->name);
+
+    wchar_t size_text[64];
+    wchar_t modified[64];
+    format_bytes(entry->size, size_text, sizeof size_text / sizeof *size_text);
+    format_local_time(entry->modified_at, modified, sizeof modified / sizeof *modified);
+
+    /* Details first: they are always available, even when no thumbnail and
+     * no text preview can be produced. */
+    wchar_t details[MAX_PATH * 2 + 512];
+    _snwprintf(details, sizeof details / sizeof *details,
+               L"%s\r\n\r\n"
+               L"Folder:    %s\r\n"
+               L"Size:      %s (%llu bytes)\r\n"
+               L"Type:      %s\r\n"
+               L"Modified:  %s\r\n"
+               L"Group:     %d\r\n"
+               L"SHA-256:   %s...\r\n",
+               entry->name, entry->folder, size_text, (unsigned long long)entry->size,
+               entry->type ? entry->type : L"", modified, entry->group,
+               entry->hash ? entry->hash : L"");
+
+    app.preview_bitmap = load_shell_thumbnail(path, scaled(PREVIEW_THUMBNAIL_EDGE));
+    if (app.preview_bitmap != NULL) {
+        SendMessageW(app.preview_image, STM_SETIMAGE, IMAGE_BITMAP,
+                     (LPARAM)app.preview_bitmap);
+    }
+
+    wchar_t *text = load_text_preview(path);
+    if (text != NULL) {
+        size_t length = wcslen(details) + wcslen(text) + 64;
+        wchar_t *combined = calloc(length, sizeof *combined);
+        if (combined != NULL) {
+            _snwprintf(combined, length, L"%s\r\n--- first %d bytes ---\r\n%s", details,
+                       PREVIEW_TEXT_BYTES, text);
+            SetWindowTextW(app.preview_text, combined);
+            free(combined);
+        } else {
+            SetWindowTextW(app.preview_text, details);
+        }
+        free(text);
+    } else {
+        SetWindowTextW(app.preview_text, details);
+    }
+}
+
 /* ---------- row model ---------- */
 
 static void free_rows(void) {
@@ -197,8 +357,14 @@ static void free_rows(void) {
     app.row_count = 0;
 }
 
+static void clear_preview_bitmap(void);
+
 static void clear_result(void) {
     free_rows();
+    clear_preview_bitmap();
+    if (app.preview_text != NULL) {
+        SetWindowTextW(app.preview_text, L"");
+    }
     if (app.has_result) {
         td_result_free(&app.result);
         app.has_result = 0;
@@ -670,13 +836,17 @@ static void show_about(void) {
 
 static void show_preview_safety(void) {
     MessageBoxW(app.main,
-                L"This port does not open, render, or preview the contents of "
-                L"scanned files.\r\n\r\n"
-                L"Files are read only to compute their size and hash, and to "
-                L"compare candidates byte for byte. Nothing scanned is parsed, "
-                L"executed, or loaded into a viewer.\r\n\r\n"
+                L"This window never parses, decodes, or executes a scanned file.\r\n\r\n"
+                L"Thumbnails come from Windows Explorer's own preview handlers, "
+                L"which render in the Shell's process, not this one. Only an "
+                L"existing thumbnail is requested; a generic type icon is refused, "
+                L"so an empty box means no thumbnail was available.\r\n\r\n"
+                L"The text preview shows the first 4096 bytes of a file as plain "
+                L"text with control characters neutralized, and is skipped entirely "
+                L"for binary content. Nothing is interpreted as markup, script, or "
+                L"a document format.\r\n\r\n"
                 L"Use Show In Explorer, then open a file with an application you "
-                L"trust if you need to inspect its contents.",
+                L"trust if you need to inspect its full contents.",
                 L"Preview Safety", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -956,7 +1126,24 @@ static void layout(int width, int height) {
     if (list_height < scaled(60)) {
         list_height = scaled(60);
     }
-    MoveWindow(app.list, margin, y, width - margin * 2, list_height, TRUE);
+    /* Results area splits into the table and a preview pane. */
+    int preview_width = scaled(300);
+    if (preview_width > width / 3) {
+        preview_width = width / 3;
+    }
+    int list_width = width - margin * 3 - preview_width;
+    if (list_width < scaled(200)) {
+        list_width = scaled(200);
+    }
+    MoveWindow(app.list, margin, y, list_width, list_height, TRUE);
+    int preview_x = margin * 2 + list_width;
+    int thumb = scaled(PREVIEW_THUMBNAIL_EDGE);
+    if (thumb > list_height / 2) {
+        thumb = list_height / 2;
+    }
+    MoveWindow(app.preview_image, preview_x, y, preview_width, thumb, TRUE);
+    MoveWindow(app.preview_text, preview_x, y + thumb + scaled(6), preview_width,
+               list_height - thumb - scaled(6), TRUE);
     MoveWindow(app.status, margin, y + list_height + scaled(6), width - margin * 2,
                status_height - scaled(6), TRUE);
 }
@@ -1017,6 +1204,15 @@ static void create_controls(HWND window) {
                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_OWNERDATA |
                                    LVS_SHOWSELALWAYS | WS_TABSTOP,
                                0, 0, 0, 0, window, (HMENU)ID_LIST, NULL, NULL);
+    app.preview_image = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", NULL,
+                                        WS_CHILD | WS_VISIBLE | SS_BITMAP | SS_CENTERIMAGE,
+                                        0, 0, 0, 0, window, NULL, NULL, NULL);
+    app.preview_text = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL,
+                                       WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+                                           ES_READONLY | ES_AUTOVSCROLL,
+                                       0, 0, 0, 0, window, NULL, NULL, NULL);
+    SendMessageW(app.preview_text, WM_SETFONT, (WPARAM)app.font, TRUE);
+
     app.status = CreateWindowExW(0, L"STATIC",
                                  L"Select a folder, run a surface scan, choose file types, "
                                  L"then find duplicates. This window never changes your files.",
@@ -1144,6 +1340,10 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
             return 0;
         }
         if (header->code == LVN_ITEMCHANGED) {
+            NMLISTVIEW *changed = (NMLISTVIEW *)lparam;
+            if (changed->uChanged & LVIF_STATE) {
+                update_preview();
+            }
             update_controls();
             return 0;
         }
@@ -1174,6 +1374,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
 
     case WM_DESTROY:
         save_settings();
+        clear_preview_bitmap();
         clear_surface();
         if (app.font != NULL) {
             DeleteObject(app.font);
