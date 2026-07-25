@@ -20,11 +20,15 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-      - name: Build and smoke-test
+      - name: Build CLI and smoke-test
         working-directory: c
         run: |
-          make
+          make cli
           make test
+      # The GUI is Windows-only; `make gui` is a no-op elsewhere.
+      - name: Build GUI
+        working-directory: c
+        run: make gui
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -45,4 +49,4 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         working-directory: rust
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
