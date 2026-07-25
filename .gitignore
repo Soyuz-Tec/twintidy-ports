@@ -2,3 +2,5 @@
 /c/twintidy.exe
 /rust/target/
 /c/twintidy-gui.exe
+/c/smoke-fixture-*
+/rust/test-fixture-*
