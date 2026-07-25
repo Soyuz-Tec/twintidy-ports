@@ -39,9 +39,9 @@ mod windows_gui {
     use windows_sys::core::{w, PCWSTR};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateFontW, DeleteObject, InvalidateRect, ScreenToClient, UpdateWindow, CLEARTYPE_QUALITY,
-        CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL,
-        HFONT, OUT_DEFAULT_PRECIS,
+        CreateFontW, DeleteObject, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, ScreenToClient,
+        UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET,
+        DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, LOGPIXELSX, OUT_DEFAULT_PRECIS,
     };
     use windows_sys::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
@@ -134,6 +134,12 @@ mod windows_gui {
         scanning: bool,
         cancel_flag: Option<Arc<AtomicBool>>,
         started_at: u64,
+
+        /// Screen DPI. The process declares itself DPI-aware, so Windows does
+        /// not scale it; every layout metric is expressed at 96 DPI and scaled
+        /// here instead. Without this, controls render at a fraction of their
+        /// intended size on a high-DPI display.
+        dpi: i32,
     }
 
     // The Win32 message loop is single-threaded; every access below happens
@@ -156,6 +162,27 @@ mod windows_gui {
 
     fn set_text(window: HWND, text: &str) {
         unsafe { SetWindowTextW(window, wide(text).as_ptr()) };
+    }
+
+    /// Scale a 96-DPI design metric to the current display.
+    fn scaled(value: i32) -> i32 {
+        let dpi = app().dpi;
+        value * if dpi > 0 { dpi } else { 96 } / 96
+    }
+
+    /// Read the DPI of the display a window is on, falling back to the desktop.
+    unsafe fn display_dpi(window: HWND) -> i32 {
+        let dc = GetDC(window);
+        if dc.is_null() {
+            return 96;
+        }
+        let dpi = GetDeviceCaps(dc, LOGPIXELSX as i32);
+        ReleaseDC(window, dc);
+        if dpi > 0 {
+            dpi
+        } else {
+            96
+        }
     }
 
     fn now_unix() -> i64 {
@@ -199,6 +226,9 @@ mod windows_gui {
                 return;
             }
 
+            // Created at a scaled size so it opens proportionate on a
+            // high-DPI display; WM_CREATE then reads its own monitor's DPI.
+            app().dpi = display_dpi(std::ptr::null_mut());
             let window = CreateWindowExW(
                 0,
                 class_name,
@@ -206,8 +236,8 @@ mod windows_gui {
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                1180,
-                720,
+                scaled(1180),
+                scaled(720),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
@@ -236,7 +266,7 @@ mod windows_gui {
         let state = app();
         state.main = window;
         state.font = CreateFontW(
-            -15,
+            -scaled(15),
             0,
             0,
             0,
@@ -389,10 +419,10 @@ mod windows_gui {
         );
 
         for (index, (title, width)) in [
-            ("Group", 70),
+            ("Group", 80),
             ("Size", 90),
             ("File", 260),
-            ("Modified", 130),
+            ("Modified", 140),
             ("Folder", 420),
         ]
         .iter()
@@ -402,7 +432,7 @@ mod windows_gui {
             let column = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
                 fmt: LVCFMT_LEFT,
-                cx: *width,
+                cx: scaled(*width),
                 pszText: heading.as_mut_ptr(),
                 cchTextMax: 0,
                 iSubItem: index as i32,
@@ -963,40 +993,49 @@ mod windows_gui {
 
     unsafe fn layout(width: i32, height: i32) {
         let state = app();
-        let margin = 12;
-        let line = 28;
-        let button = 130;
+        // All metrics are 96-DPI design values passed through scaled(), so
+        // the window keeps its proportions on any display scaling.
+        let margin = scaled(12);
+        let line = scaled(32);
+        let button = scaled(140);
 
         let mut y = margin;
         MoveWindow(state.select_button, margin, y, button, line, 1);
         MoveWindow(
             state.path_label,
             margin * 2 + button,
-            y + 4,
+            y + scaled(6),
             width - (margin * 3 + button),
             line,
             1,
         );
 
-        y += line + 8;
-        MoveWindow(state.focus_label, margin, y, width - margin * 2, 18, 1);
-        y += 20;
+        y += line + scaled(8);
+        MoveWindow(
+            state.focus_label,
+            margin,
+            y,
+            width - margin * 2,
+            scaled(20),
+            1,
+        );
+        y += scaled(24);
 
         // Category checkboxes wrap across the available width.
-        let check_width = 132;
+        let check_width = scaled(150);
         let mut column = 0;
         for check in &state.category_checks {
             let mut x = margin + column * check_width;
             if x + check_width > width - margin && column > 0 {
                 column = 0;
                 x = margin;
-                y += 24;
+                y += scaled(26);
             }
-            MoveWindow(*check, x, y, check_width - 6, 22, 1);
+            MoveWindow(*check, x, y, check_width - scaled(6), scaled(24), 1);
             column += 1;
         }
 
-        y += 32;
+        y += scaled(36);
         MoveWindow(state.surface_button, margin, y, button, line, 1);
         MoveWindow(state.find_button, margin * 2 + button, y, button, line, 1);
         MoveWindow(
@@ -1007,17 +1046,31 @@ mod windows_gui {
             line,
             1,
         );
-        let progress_width = (width - (margin * 5 + button * 3 + 180)).max(60);
+        let progress_width = (width - (margin * 5 + button * 3 + scaled(190))).max(scaled(60));
         MoveWindow(
             state.progress,
             margin * 4 + button * 3,
-            y + 4,
+            y + scaled(6),
             progress_width,
-            line - 8,
+            line - scaled(12),
             1,
         );
-        MoveWindow(state.stage_label, width - margin - 176, y + 6, 110, 18, 1);
-        MoveWindow(state.elapsed_label, width - margin - 62, y + 6, 62, 18, 1);
+        MoveWindow(
+            state.stage_label,
+            width - margin - scaled(186),
+            y + scaled(8),
+            scaled(120),
+            scaled(20),
+            1,
+        );
+        MoveWindow(
+            state.elapsed_label,
+            width - margin - scaled(66),
+            y + scaled(8),
+            scaled(66),
+            scaled(20),
+            1,
+        );
 
         y += line + margin;
         MoveWindow(state.keep_newest_button, margin, y, button, line, 1);
@@ -1049,21 +1102,21 @@ mod windows_gui {
             state.explorer_button,
             margin * 5 + button * 4,
             y,
-            button + 20,
+            button + scaled(20),
             line,
             1,
         );
 
         y += line + margin;
-        let status_height = 34;
-        let list_height = (height - y - status_height - margin).max(60);
+        let status_height = scaled(38);
+        let list_height = (height - y - status_height - margin).max(scaled(60));
         MoveWindow(state.list, margin, y, width - margin * 2, list_height, 1);
         MoveWindow(
             state.status,
             margin,
-            y + list_height + 6,
+            y + list_height + scaled(6),
             width - margin * 2,
-            status_height - 6,
+            status_height - scaled(6),
             1,
         );
     }
@@ -1076,6 +1129,7 @@ mod windows_gui {
     ) -> LRESULT {
         match message {
             WM_CREATE => {
+                app().dpi = display_dpi(window);
                 create_controls(window);
                 update_controls();
                 0
@@ -1086,8 +1140,8 @@ mod windows_gui {
             }
             WM_GETMINMAXINFO => {
                 let limits = lparam as *mut MINMAXINFO;
-                (*limits).ptMinTrackSize.x = 900;
-                (*limits).ptMinTrackSize.y = 560;
+                (*limits).ptMinTrackSize.x = scaled(980);
+                (*limits).ptMinTrackSize.y = scaled(600);
                 0
             }
             WM_TIMER => {

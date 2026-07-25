@@ -85,9 +85,29 @@ typedef struct {
     volatile LONG cancel_requested;
     volatile LONG scanning;
     ULONGLONG started_at;
+
+    /* Screen DPI. The process declares itself DPI-aware, so Windows does not
+     * scale it; every layout metric below is expressed at 96 DPI and scaled
+     * here instead. Without this, controls render at a fraction of their
+     * intended size on a high-DPI display. */
+    int dpi;
 } app_state;
 
 static app_state app;
+
+/* Scale a 96-DPI design metric to the current display. */
+static int scaled(int value) { return MulDiv(value, app.dpi > 0 ? app.dpi : 96, 96); }
+
+/* Read the DPI of the display a window is on, falling back to the desktop. */
+static int display_dpi(HWND window) {
+    HDC dc = GetDC(window);
+    if (dc == NULL) {
+        return 96;
+    }
+    int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(window, dc);
+    return dpi > 0 ? dpi : 96;
+}
 
 /* ---------- string helpers ---------- */
 
@@ -692,66 +712,70 @@ static void on_list_click(void) {
 
 /* ---------- layout ---------- */
 
+/*
+ * All metrics below are 96-DPI design values passed through scaled(), so the
+ * window keeps its proportions on any display scaling.
+ */
 static void layout(int width, int height) {
-    const int margin = 12;
-    const int line = 28;
-    const int button = 130;
+    const int margin = scaled(12);
+    const int line = scaled(32);
+    const int button = scaled(140);
 
     int y = margin;
     MoveWindow(app.select_button, margin, y, button, line, TRUE);
-    MoveWindow(app.path_label, margin * 2 + button, y + 4,
+    MoveWindow(app.path_label, margin * 2 + button, y + scaled(6),
                width - (margin * 3 + button), line, TRUE);
 
-    y += line + 8;
-    MoveWindow(app.focus_label, margin, y, width - margin * 2, 18, TRUE);
-    y += 20;
+    y += line + scaled(8);
+    MoveWindow(app.focus_label, margin, y, width - margin * 2, scaled(20), TRUE);
+    y += scaled(24);
 
     /* Category checkboxes wrap across the available width. */
-    const int check_width = 132;
+    const int check_width = scaled(150);
     int column = 0;
     for (size_t i = 0; i < TD_CATEGORY_COUNT; i++) {
         int x = margin + column * check_width;
         if (x + check_width > width - margin && column > 0) {
             column = 0;
             x = margin;
-            y += 24;
+            y += scaled(26);
         }
-        MoveWindow(app.category_checks[i], x, y, check_width - 6, 22, TRUE);
+        MoveWindow(app.category_checks[i], x, y, check_width - scaled(6), scaled(24), TRUE);
         column++;
     }
 
-    y += 32;
+    y += scaled(36);
     MoveWindow(app.surface_button, margin, y, button, line, TRUE);
     MoveWindow(app.find_button, margin * 2 + button, y, button, line, TRUE);
     MoveWindow(app.cancel_button, margin * 3 + button * 2, y, button, line, TRUE);
-    int progress_width = width - (margin * 5 + button * 3 + 180);
-    if (progress_width < 60) {
-        progress_width = 60;
+    int progress_width = width - (margin * 5 + button * 3 + scaled(190));
+    if (progress_width < scaled(60)) {
+        progress_width = scaled(60);
     }
-    MoveWindow(app.progress, margin * 4 + button * 3, y + 4, progress_width, line - 8, TRUE);
-    MoveWindow(app.stage_label, width - margin - 176, y + 6, 110, 18, TRUE);
-    MoveWindow(app.elapsed_label, width - margin - 62, y + 6, 62, 18, TRUE);
+    MoveWindow(app.progress, margin * 4 + button * 3, y + scaled(6), progress_width, line - scaled(12), TRUE);
+    MoveWindow(app.stage_label, width - margin - scaled(186), y + scaled(8), scaled(120), scaled(20), TRUE);
+    MoveWindow(app.elapsed_label, width - margin - scaled(66), y + scaled(8), scaled(66), scaled(20), TRUE);
 
     y += line + margin;
     MoveWindow(app.keep_newest_button, margin, y, button, line, TRUE);
     MoveWindow(app.keep_oldest_button, margin * 2 + button, y, button, line, TRUE);
     MoveWindow(app.clear_select_button, margin * 3 + button * 2, y, button, line, TRUE);
     MoveWindow(app.export_button, margin * 4 + button * 3, y, button, line, TRUE);
-    MoveWindow(app.explorer_button, margin * 5 + button * 4, y, button + 20, line, TRUE);
+    MoveWindow(app.explorer_button, margin * 5 + button * 4, y, button + scaled(20), line, TRUE);
 
     y += line + margin;
-    const int status_height = 34;
+    const int status_height = scaled(38);
     int list_height = height - y - status_height - margin;
-    if (list_height < 60) {
-        list_height = 60;
+    if (list_height < scaled(60)) {
+        list_height = scaled(60);
     }
     MoveWindow(app.list, margin, y, width - margin * 2, list_height, TRUE);
-    MoveWindow(app.status, margin, y + list_height + 6, width - margin * 2,
-               status_height - 6, TRUE);
+    MoveWindow(app.status, margin, y + list_height + scaled(6), width - margin * 2,
+               status_height - scaled(6), TRUE);
 }
 
 static void create_controls(HWND window) {
-    app.font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    app.font = CreateFontW(-scaled(15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
@@ -817,12 +841,12 @@ static void create_controls(HWND window) {
         const wchar_t *title;
         int width;
     } columns[] = {
-        {L"Group", 70}, {L"Size", 90}, {L"File", 260}, {L"Modified", 130}, {L"Folder", 420},
+        {L"Group", 80}, {L"Size", 90}, {L"File", 260}, {L"Modified", 140}, {L"Folder", 420},
     };
     for (int i = 0; i < 5; i++) {
         column.iSubItem = i;
         column.pszText = (LPWSTR)columns[i].title;
-        column.cx = columns[i].width;
+        column.cx = scaled(columns[i].width);
         ListView_InsertColumn(app.list, i, &column);
     }
 }
@@ -832,6 +856,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
     switch (message) {
     case WM_CREATE:
         app.main = window;
+        app.dpi = display_dpi(window);
         create_controls(window);
         update_controls();
         return 0;
@@ -842,8 +867,8 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *limits = (MINMAXINFO *)lparam;
-        limits->ptMinTrackSize.x = 900;
-        limits->ptMinTrackSize.y = 560;
+        limits->ptMinTrackSize.x = scaled(980);
+        limits->ptMinTrackSize.y = scaled(600);
         return 0;
     }
 
@@ -974,10 +999,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         return 1;
     }
 
+    /* The window is created at a scaled size so it opens proportionate on
+     * a high-DPI display; WM_CREATE then reads the DPI of its own monitor. */
+    app.dpi = display_dpi(NULL);
     HWND window = CreateWindowExW(0, class.lpszClassName,
                                   L"TwinTidy (C port) - Duplicate File Review",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  1180, 720, NULL, NULL, instance, NULL);
+                                  scaled(1180), scaled(720), NULL, NULL, instance, NULL);
     if (window == NULL) {
         return 1;
     }
