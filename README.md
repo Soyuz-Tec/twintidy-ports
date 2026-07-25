@@ -54,6 +54,8 @@ The GUI follows the same two-phase workflow as the Go application:
 3. **Find Duplicates** hashes only the selected types, with live stage, elapsed time, and a working Cancel.
 4. Review results with row checkboxes, **Keep Newest** / **Keep Oldest** / **Clear Selection**, **Show In Explorer**, and **Export Report** (CSV or JSON).
 
+Selecting a row fills the **preview pane** beside the table with its thumbnail, details, and a bounded text preview. **Clear Results**, **Reset**, **About**, and **Preview Safety** are also available, and window placement and the last scanned folder are remembered between sessions.
+
 Keep Newest and Keep Oldest always leave one copy of every group unchecked. Selection is planning only: neither window offers any action that deletes, moves, or modifies a file.
 
 ## Building
@@ -76,8 +78,17 @@ The Rust library and CLI use the **standard library only**. The Rust GUI additio
 
 ## Known limitations
 
-- The C GUI converts engine paths for display using the active code page, so paths containing characters outside it may render with substitutions. This affects display only, never which files the engine compares.
-- Neither port implements TwinTidy's Windows file-identity capture or hardlink consolidation, so they can plan cleanup but never perform it.
+- **No cleanup.** Neither port implements TwinTidy's Windows file-identity capture or hardlink consolidation, so they can find duplicates and plan what to do about them, but never reclaim space. Only the Go application can do that.
+- **Long paths are not supported.** Neither port emits the `\\?\` prefix, so files whose full path exceeds 260 characters are silently absent from results rather than reported as skipped. Deeply nested trees will under-report.
+- **Single-threaded.** Both ports hash one file at a time. The Go engine uses a worker pool, so it scales considerably better on large trees; expect the ports to be slower on multi-core machines even though the per-file work is the same.
+- **The C GUI converts paths for display using the active code page**, so paths containing characters outside it may render with substitutions. This affects display only, never which files the engine compares.
+
+## Preview safety
+
+The preview pane shows a thumbnail, file details, and a bounded text preview. Neither port parses, decodes, or executes a scanned file:
+
+- Thumbnails come from `IShellItemImageFactory`, so Windows Explorer's own preview handlers render them in the Shell's process. `SIIGBF_THUMBNAILONLY` refuses a generic type icon, so an empty box means no thumbnail exists rather than showing a placeholder that resembles content.
+- The text preview reads at most 4096 bytes, neutralizes control characters, and is skipped entirely when a NUL byte reveals binary content.
 
 ## License
 
