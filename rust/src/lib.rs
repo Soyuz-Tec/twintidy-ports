@@ -16,6 +16,7 @@
 
 pub mod report;
 pub mod safety;
+pub mod settings;
 pub mod sha256;
 
 pub use safety::{category_for_path, is_user_created_file, should_skip_directory, Category};
