@@ -2,11 +2,41 @@
 name = "twintidy"
 version = "0.1.0"
 edition = "2021"
-description = "Rust port of TwinTidy's duplicate-detection core (read-only CLI)"
+description = "Rust port of TwinTidy's duplicate-detection core (read-only CLI and Windows GUI)"
 license = "MIT"
 repository = "https://github.com/Soyuz-Tec/twintidy-ports"
 
-[dependencies]
+[lib]
+name = "twintidy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "twintidy"
+path = "src/main.rs"
+
+# Windows-only GUI front end. Guarded so `cargo build` on Linux skips it.
+[[bin]]
+name = "twintidy-gui"
+path = "src/bin/gui.rs"
+required-features = []
+
+# The library and CLI depend on the standard library only. The GUI binary
+# needs Win32 bindings; windows-sys is Microsoft's official crate and is
+# pulled in on Windows targets alone.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 [profile.release]
 lto = true
