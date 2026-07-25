@@ -31,6 +31,7 @@ mod windows_gui {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use twintidy::report::{self, Format};
+    use twintidy::settings::{self, Settings};
     use twintidy::{
         find_duplicates, format_bytes, format_timestamp, surface_scan, Category, Flow, Options,
         ScanError, ScanResult, Stage, SurfaceReport,
@@ -79,6 +80,10 @@ mod windows_gui {
     const ID_CLEAR_SELECT: usize = 1008;
     const ID_EXPORT: usize = 1009;
     const ID_EXPLORER: usize = 1010;
+    const ID_CLEAR_RESULTS: usize = 1011;
+    const ID_RESET: usize = 1012;
+    const ID_ABOUT: usize = 1013;
+    const ID_PREVIEW_SAFETY: usize = 1014;
     const ID_CATEGORY_BASE: usize = 1100;
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
@@ -94,6 +99,10 @@ mod windows_gui {
         checked: bool,
         name: Vec<u16>,
         folder: Vec<u16>,
+        /// Category label.
+        kind: Vec<u16>,
+        /// Abbreviated SHA-256 of the group; the full digest is in the report.
+        hash: Vec<u16>,
         full_path: PathBuf,
     }
 
@@ -116,6 +125,12 @@ mod windows_gui {
         clear_select_button: HWND,
         export_button: HWND,
         explorer_button: HWND,
+        clear_results_button: HWND,
+        reset_button: HWND,
+        about_button: HWND,
+        preview_safety_button: HWND,
+        files_label: HWND,
+        current_label: HWND,
         list: HWND,
         progress: HWND,
         status: HWND,
@@ -134,6 +149,8 @@ mod windows_gui {
         scanning: bool,
         cancel_flag: Option<Arc<AtomicBool>>,
         started_at: u64,
+
+        settings_path: Option<PathBuf>,
 
         /// Screen DPI. The process declares itself DPI-aware, so Windows does
         /// not scale it; every layout metric is expressed at 96 DPI and scaled
@@ -382,6 +399,24 @@ mod windows_gui {
             ID_EXPLORER,
             0,
         );
+        state.clear_results_button = child(
+            w!("BUTTON"),
+            w!("Clear Results"),
+            BS_PUSHBUTTON as u32,
+            ID_CLEAR_RESULTS,
+            0,
+        );
+        state.reset_button = child(w!("BUTTON"), w!("Reset"), BS_PUSHBUTTON as u32, ID_RESET, 0);
+        state.preview_safety_button = child(
+            w!("BUTTON"),
+            w!("Preview Safety"),
+            BS_PUSHBUTTON as u32,
+            ID_PREVIEW_SAFETY,
+            0,
+        );
+        state.about_button = child(w!("BUTTON"), w!("About"), BS_PUSHBUTTON as u32, ID_ABOUT, 0);
+        state.files_label = child(w!("STATIC"), w!(""), 0, 0, 0);
+        state.current_label = child(w!("STATIC"), w!(""), SS_PATHELLIPSIS, 0, 0);
 
         state.category_checks = (0..Category::ALL.len())
             .map(|index| {
@@ -419,11 +454,14 @@ mod windows_gui {
         );
 
         for (index, (title, width)) in [
-            ("Group", 80),
+            ("No.", 55),
+            ("Group", 62),
+            ("Name", 230),
             ("Size", 90),
-            ("File", 260),
+            ("Type", 95),
             ("Modified", 140),
-            ("Folder", 420),
+            ("Hash", 130),
+            ("Folder", 380),
         ]
         .iter()
         .enumerate()
@@ -489,6 +527,12 @@ mod windows_gui {
         EnableWindow(state.clear_select_button, (!busy && has_checked) as i32);
         EnableWindow(state.export_button, (!busy && has_rows) as i32);
         EnableWindow(state.explorer_button, (!busy && has_selection) as i32);
+        EnableWindow(state.clear_results_button, (!busy && has_rows) as i32);
+        EnableWindow(
+            state.reset_button,
+            (!busy && (state.folder.is_some() || state.surface.is_some())) as i32,
+        );
+        // About and Preview Safety stay available: they only show text.
     }
 
     /// Label each category checkbox with the count found by the surface scan,
@@ -548,6 +592,9 @@ mod windows_gui {
                     .parent()
                     .map(|value| value.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                // Show a short hash prefix: the full 64 characters are in the
+                // exported report, but a column that wide is unreadable.
+                let short_hash: String = group.hash.chars().take(16).collect();
                 rows.push(Row {
                     group: index + 1,
                     size: file.size,
@@ -555,6 +602,8 @@ mod windows_gui {
                     checked: false,
                     name: wide(&name),
                     folder: wide(&folder),
+                    kind: wide(file.category.label()),
+                    hash: wide(&short_hash),
                     full_path: file.path.clone(),
                 });
             }
@@ -690,6 +739,12 @@ mod windows_gui {
             return;
         }
         let Some(root) = state.folder.clone() else {
+            MessageBoxW(
+                state.main,
+                w!("Choose a folder before scanning."),
+                w!("Select Folder"),
+                MB_OK | MB_ICONINFORMATION,
+            );
             return;
         };
         clear_surface();
@@ -724,10 +779,20 @@ mod windows_gui {
         let Some(surface) = state.surface.clone() else {
             return;
         };
+        let categories = selected_categories();
+        if categories.is_empty() {
+            MessageBoxW(
+                state.main,
+                w!("Select at least one file type before finding duplicates."),
+                w!("Select File Types"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        }
         clear_result();
 
         let options = Options {
-            categories: selected_categories(),
+            categories,
             ..Default::default()
         };
         let flag = begin_operation("Finding duplicates in the selected file types...");
@@ -785,6 +850,125 @@ mod windows_gui {
             argument.as_ptr(),
             std::ptr::null(),
             SW_SHOWNORMAL,
+        );
+    }
+
+    /// Persist window placement and the last scanned folder. Failures are
+    /// ignored: preferences are a convenience, never a precondition.
+    unsafe fn save_settings() {
+        let state = app();
+        let Some(path) = state.settings_path.clone() else {
+            return;
+        };
+        let mut value = Settings {
+            last_folder: state.folder.clone(),
+            ..Default::default()
+        };
+        let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(state.main, &mut placement) != 0 {
+            value.x = placement.rcNormalPosition.left;
+            value.y = placement.rcNormalPosition.top;
+            value.width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+            value.height = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+            value.maximized = placement.showCmd == SW_SHOWMAXIMIZED as u32;
+        }
+        let _ = settings::save(&path, &value);
+    }
+
+    /// Restore placement, clamping to the virtual screen so a window saved on
+    /// a monitor that is no longer attached cannot open off-screen.
+    unsafe fn apply_settings(value: &Settings) {
+        let state = app();
+        if value.has_placement() {
+            let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let right = left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let bottom = top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if value.x < right
+                && value.y < bottom
+                && value.x + value.width > left
+                && value.y + value.height > top
+            {
+                MoveWindow(state.main, value.x, value.y, value.width, value.height, 1);
+            }
+        }
+        if value.maximized {
+            ShowWindow(state.main, SW_SHOWMAXIMIZED);
+        }
+        // Only offer the stored folder if it still exists.
+        if let Some(folder) = &value.last_folder {
+            if folder.is_dir() {
+                set_text(state.path_label, &folder.to_string_lossy());
+                state.folder = Some(folder.clone());
+                set_text(
+                    state.status,
+                    "Restored your last folder. Choose Surface Scan to inventory user files.",
+                );
+            }
+        }
+    }
+
+    /// Discard duplicate results but keep the surface inventory, so the user
+    /// can adjust the file-type focus and search again without rescanning.
+    unsafe fn clear_results_action() {
+        clear_result();
+        let state = app();
+        set_text(state.stage_label, "");
+        set_text(
+            state.status,
+            "Results cleared. The surface inventory is still available; \
+             adjust the file-type focus and choose Find Duplicates.",
+        );
+        update_controls();
+    }
+
+    /// Return to the initial state, discarding folder, inventory, and results.
+    unsafe fn reset_action() {
+        clear_surface();
+        let state = app();
+        state.folder = None;
+        set_text(state.path_label, "No folder selected.");
+        set_text(state.stage_label, "");
+        set_text(state.elapsed_label, "");
+        set_text(state.files_label, "");
+        set_text(state.current_label, "");
+        refresh_category_labels();
+        set_text(state.status, "Reset. Select a folder to begin.");
+        update_controls();
+    }
+
+    unsafe fn show_about() {
+        MessageBoxW(
+            app().main,
+            w!("TwinTidy (Rust port)\r\n\r\n\
+                A Rust port of the duplicate-detection core of TwinTidy, the \
+                safety-first Windows duplicate-file finder by Kayilan Inc.\r\n\r\n\
+                This window is read-only: it finds and reports duplicates and \
+                never deletes, moves, or modifies a file. Checkbox selection \
+                plans cleanup for export; it does not perform it.\r\n\r\n\
+                Protected system folders, dependency trees, build output, and \
+                executable file types are excluded from every scan.\r\n\r\n\
+                MIT licensed. Copyright (c) 2026 Kayilan Inc."),
+            w!("About TwinTidy"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+
+    unsafe fn show_preview_safety() {
+        MessageBoxW(
+            app().main,
+            w!(
+                "This port does not open, render, or preview the contents of \
+                scanned files.\r\n\r\n\
+                Files are read only to compute their size and hash, and to \
+                compare candidates byte for byte. Nothing scanned is parsed, \
+                executed, or loaded into a viewer.\r\n\r\n\
+                Use Show In Explorer, then open a file with an application you \
+                trust if you need to inspect its contents."
+            ),
+            w!("Preview Safety"),
+            MB_OK | MB_ICONINFORMATION,
         );
     }
 
@@ -854,6 +1038,12 @@ mod windows_gui {
         let message = Box::from_raw(raw as *mut ProgressMessage);
         let state = app();
         set_text(state.stage_label, message.stage);
+        let counts = if message.total > 0 {
+            format!("{} / {} files", message.done, message.total)
+        } else {
+            format!("{} files", message.done)
+        };
+        set_text(state.files_label, &counts);
         if message.total > 0 {
             SendMessageW(state.progress, PBM_SETMARQUEE, 0, 0);
             SetWindowLongPtrW(
@@ -952,10 +1142,13 @@ mod windows_gui {
         // borrowed strings, and formatted columns reuse this buffer.
         static mut SCRATCH: Vec<u16> = Vec::new();
         match item.iSubItem {
-            0 | 1 | 3 => {
+            // Columns whose text is formatted on demand.
+            0 | 1 | 3 | 5 => {
                 let text = match item.iSubItem {
-                    0 => row.group.to_string(),
-                    1 => format_bytes(row.size),
+                    // No. — 1-based row number, matching the exported order.
+                    0 => (item.iItem + 1).to_string(),
+                    1 => row.group.to_string(),
+                    3 => format_bytes(row.size),
                     _ => format_timestamp(row.modified_at),
                 };
                 #[allow(static_mut_refs)]
@@ -964,8 +1157,11 @@ mod windows_gui {
                     item.pszText = SCRATCH.as_mut_ptr();
                 }
             }
+            // Columns backed by strings the row already owns.
             2 => item.pszText = row.name.as_ptr() as *mut u16,
-            4 => item.pszText = row.folder.as_ptr() as *mut u16,
+            4 => item.pszText = row.kind.as_ptr() as *mut u16,
+            6 => item.pszText = row.hash.as_ptr() as *mut u16,
+            7 => item.pszText = row.folder.as_ptr() as *mut u16,
             _ => {}
         }
     }
@@ -1107,6 +1303,42 @@ mod windows_gui {
             1,
         );
 
+        y += line + scaled(8);
+        MoveWindow(state.clear_results_button, margin, y, button, line, 1);
+        MoveWindow(state.reset_button, margin * 2 + button, y, button, line, 1);
+        MoveWindow(
+            state.preview_safety_button,
+            margin * 3 + button * 2,
+            y,
+            button,
+            line,
+            1,
+        );
+        MoveWindow(
+            state.about_button,
+            margin * 4 + button * 3,
+            y,
+            button,
+            line,
+            1,
+        );
+        MoveWindow(
+            state.files_label,
+            margin * 5 + button * 4,
+            y + scaled(8),
+            scaled(140),
+            scaled(20),
+            1,
+        );
+        MoveWindow(
+            state.current_label,
+            margin * 5 + button * 4 + scaled(150),
+            y + scaled(8),
+            width - (margin * 6 + button * 4 + scaled(150)),
+            scaled(20),
+            1,
+        );
+
         y += line + margin;
         let status_height = scaled(38);
         let list_height = (height - y - status_height - margin).max(scaled(60));
@@ -1131,6 +1363,11 @@ mod windows_gui {
             WM_CREATE => {
                 app().dpi = display_dpi(window);
                 create_controls(window);
+                if let Some(path) = settings::default_path() {
+                    let stored = settings::load(&path);
+                    app().settings_path = Some(path);
+                    apply_settings(&stored);
+                }
                 update_controls();
                 0
             }
@@ -1163,6 +1400,10 @@ mod windows_gui {
                     ID_CLEAR_SELECT => clear_selection(),
                     ID_EXPORT => export_report(),
                     ID_EXPLORER => show_in_explorer(),
+                    ID_CLEAR_RESULTS => clear_results_action(),
+                    ID_RESET => reset_action(),
+                    ID_ABOUT => show_about(),
+                    ID_PREVIEW_SAFETY => show_preview_safety(),
                     _ => return DefWindowProcW(window, message, wparam, lparam),
                 }
                 0
@@ -1211,6 +1452,7 @@ mod windows_gui {
                 0
             }
             WM_DESTROY => {
+                save_settings();
                 let state = app();
                 if !state.font.is_null() {
                     DeleteObject(state.font);

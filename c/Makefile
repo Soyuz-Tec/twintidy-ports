@@ -8,8 +8,8 @@ CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 TARGET  := twintidy
 GUI     :=
 
-ENGINE  := src/scanner.c src/safety.c src/sha256.c src/report.c
-HEADERS := src/scanner.h src/safety.h src/sha256.h src/report.h
+ENGINE  := src/scanner.c src/safety.c src/sha256.c src/report.c src/settings.c
+HEADERS := src/scanner.h src/safety.h src/sha256.h src/report.h src/settings.h
 
 ifeq ($(OS),Windows_NT)
 TARGET  := twintidy.exe
