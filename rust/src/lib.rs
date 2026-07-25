@@ -235,12 +235,37 @@ where
     Ok(report)
 }
 
+/// Traverse `root`, draining an explicit stack of pending directories.
+///
+/// Traversal is iterative rather than recursive: a deeply nested tree — which
+/// a scan target may legitimately be, and which a hostile one certainly can
+/// be — would otherwise exhaust the call stack before any cardinality limit
+/// was reached.
 fn walk<F>(
+    root: &Path,
+    options: &Options,
+    report: &mut SurfaceReport,
+    stats: &mut HashMap<Category, CategoryStats>,
+    progress: &mut F,
+) -> Result<(), ScanError>
+where
+    F: FnMut(Stage, usize, usize) -> Flow,
+{
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        read_directory(&dir, options, report, stats, progress, &mut pending)?;
+    }
+    Ok(())
+}
+
+/// Read one directory, queueing any subdirectories onto `pending`.
+fn read_directory<F>(
     dir: &Path,
     options: &Options,
     report: &mut SurfaceReport,
     stats: &mut HashMap<Category, CategoryStats>,
     progress: &mut F,
+    pending: &mut Vec<PathBuf>,
 ) -> Result<(), ScanError>
 where
     F: FnMut(Stage, usize, usize) -> Flow,
@@ -277,7 +302,7 @@ where
             if should_skip_directory(&path) {
                 report.skipped_system_items += 1;
             } else {
-                walk(&path, options, report, stats, progress)?;
+                pending.push(path);
             }
         } else if meta.is_file() {
             if !is_user_created_file(&path) {

@@ -17,7 +17,7 @@ GUI     := twintidy-gui.exe
 LDFLAGS += -static
 endif
 
-.PHONY: all cli gui clean test
+.PHONY: all cli gui clean test unit-test
 
 all: cli gui
 
@@ -34,8 +34,19 @@ $(TARGET): src/main.c $(ENGINE) $(HEADERS)
 twintidy-gui.exe: src/gui.c $(ENGINE) $(HEADERS)
 	$(CC) $(CFLAGS) -mwindows -municode -o $@ src/gui.c $(ENGINE) $(LDFLAGS) -lcomctl32 -lole32 -lshell32 -lcomdlg32
 
-test: $(TARGET)
+UNIT := twintidy-unit
+ifeq ($(OS),Windows_NT)
+UNIT := twintidy-unit.exe
+endif
+
+$(UNIT): test/unit.c $(ENGINE) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ test/unit.c $(ENGINE) $(LDFLAGS)
+
+unit-test: $(UNIT)
+	./$(UNIT)
+
+test: $(TARGET) unit-test
 	sh test/smoke.sh ./$(TARGET)
 
 clean:
-	rm -f twintidy twintidy.exe twintidy-gui.exe
+	rm -f twintidy twintidy.exe twintidy-gui.exe twintidy-unit twintidy-unit.exe

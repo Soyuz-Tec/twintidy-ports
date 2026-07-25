@@ -5,3 +5,5 @@
 /c/smoke-fixture-*
 /rust/test-fixture-*
 /rust/test-settings-*
+/c/twintidy-unit
+/c/twintidy-unit.exe
