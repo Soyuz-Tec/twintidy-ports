@@ -6,6 +6,7 @@
 
 #define _DEFAULT_SOURCE
 
+#include "report.h"
 #include "scanner.h"
 
 #include <stdio.h>
@@ -23,6 +24,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "                       pdf text word excel powerpoint images\n");
     fprintf(stderr, "                       audio video archives other\n");
     fprintf(stderr, "  --surface            report the surface inventory and exit\n");
+    fprintf(stderr, "  --export PATH        write the duplicate report to PATH\n");
+    fprintf(stderr, "  --format csv|json    report format (default csv)\n");
     fprintf(stderr, "  --help               show this help\n\n");
     fprintf(stderr, "Exit codes: 0 no duplicates, 1 duplicates found, 2 error.\n");
 }
@@ -54,6 +57,8 @@ int main(int argc, char **argv) {
     size_t excluded_path_count = 0;
     size_t excluded_extension_count = 0;
     const char *root = NULL;
+    const char *export_path = NULL;
+    td_report_format format = TD_REPORT_CSV;
     int surface_only = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -64,6 +69,16 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argument, "--surface") == 0) {
             surface_only = 1;
+        } else if (strcmp(argument, "--export") == 0 && i + 1 < argc) {
+            export_path = argv[++i];
+        } else if (strcmp(argument, "--format") == 0 && i + 1 < argc) {
+            const char *name = argv[++i];
+            if (strcmp(name, "json") == 0) {
+                format = TD_REPORT_JSON;
+            } else if (strcmp(name, "csv") != 0) {
+                fprintf(stderr, "unsupported report format: %s\n", name);
+                return 2;
+            }
         } else if (strcmp(argument, "--min-size") == 0 && i + 1 < argc) {
             options.min_file_size = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argument, "--exclude") == 0 && i + 1 < argc) {
@@ -153,6 +168,13 @@ int main(int argc, char **argv) {
         for (size_t f = 0; f < result.groups[g].count; f++) {
             printf("  %s\n", result.groups[g].files[f].path);
         }
+    }
+
+    if (export_path != NULL &&
+        !td_report_write_file(export_path, format, root, &result)) {
+        fprintf(stderr, "could not write the report to %s\n", export_path);
+        td_result_free(&result);
+        return 2;
     }
 
     int exit_code;

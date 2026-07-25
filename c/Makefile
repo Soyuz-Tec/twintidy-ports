@@ -8,8 +8,8 @@ CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 TARGET  := twintidy
 GUI     :=
 
-ENGINE  := src/scanner.c src/safety.c src/sha256.c
-HEADERS := src/scanner.h src/safety.h src/sha256.h
+ENGINE  := src/scanner.c src/safety.c src/sha256.c src/report.c
+HEADERS := src/scanner.h src/safety.h src/sha256.h src/report.h
 
 ifeq ($(OS),Windows_NT)
 TARGET  := twintidy.exe
@@ -32,7 +32,7 @@ $(TARGET): src/main.c $(ENGINE) $(HEADERS)
 # -municode selects the wide wWinMain entry point so the window uses the
 # Unicode Win32 API throughout.
 twintidy-gui.exe: src/gui.c $(ENGINE) $(HEADERS)
-	$(CC) $(CFLAGS) -mwindows -municode -o $@ src/gui.c $(ENGINE) $(LDFLAGS) -lcomctl32 -lole32 -lshell32
+	$(CC) $(CFLAGS) -mwindows -municode -o $@ src/gui.c $(ENGINE) $(LDFLAGS) -lcomctl32 -lole32 -lshell32 -lcomdlg32
 
 test: $(TARGET)
 	sh test/smoke.sh ./$(TARGET)

@@ -7,6 +7,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use twintidy::report::{self, Format};
 use twintidy::{find_duplicates, surface_scan, Category, Flow, Options, ScanError};
 
 fn print_usage(program: &str) {
@@ -20,6 +21,8 @@ fn print_usage(program: &str) {
     eprintln!("                       pdf text word excel powerpoint images");
     eprintln!("                       audio video archives other");
     eprintln!("  --surface            report the surface inventory and exit");
+    eprintln!("  --export PATH        write the duplicate report to PATH");
+    eprintln!("  --format csv|json    report format (default csv)");
     eprintln!("  --help               show this help\n");
     eprintln!("Exit codes: 0 no duplicates, 1 duplicates found, 2 error.");
 }
@@ -29,6 +32,8 @@ fn main() -> ExitCode {
     let mut options = Options::default();
     let mut root: Option<PathBuf> = None;
     let mut surface_only = false;
+    let mut export_path: Option<PathBuf> = None;
+    let mut format = Format::Csv;
 
     let mut index = 1;
     while index < args.len() {
@@ -47,6 +52,20 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--surface" => surface_only = true,
+            "--export" => match take_value(&mut index) {
+                Some(value) => export_path = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--export requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--format" => match take_value(&mut index).and_then(|v| Format::from_name(&v)) {
+                Some(value) => format = value,
+                None => {
+                    eprintln!("--format must be csv or json");
+                    return ExitCode::from(2);
+                }
+            },
             "--min-size" => match take_value(&mut index).and_then(|v| v.parse::<u64>().ok()) {
                 Some(value) => options.min_file_size = value,
                 None => {
@@ -160,6 +179,26 @@ fn main() -> ExitCode {
         println!("  sha256 {}", group.hash);
         for file in &group.files {
             println!("  {}", file.path.display());
+        }
+    }
+
+    if let Some(destination) = &export_path {
+        let generated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(error) = report::write_file(
+            destination,
+            format,
+            &root.to_string_lossy(),
+            &result,
+            generated_at,
+        ) {
+            eprintln!(
+                "could not write the report to {}: {error}",
+                destination.display()
+            );
+            return ExitCode::from(2);
         }
     }
 

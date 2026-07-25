@@ -14,6 +14,7 @@
 //! Read-only: nothing here deletes, moves, or modifies a file.
 //! Standard library only — no external crates.
 
+pub mod report;
 pub mod safety;
 pub mod sha256;
 
