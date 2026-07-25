@@ -69,6 +69,34 @@ SURFACE="$("$ABS_BIN" --surface "$DIR")"
 echo "$SURFACE" | grep -q "user file(s)" || fail "surface inventory missing totals"
 echo "$SURFACE" | grep -q "Text" || fail "surface inventory missing category stats"
 
+# --- report export -------------------------------------------------------
+# A folder named with a leading "=" proves the CSV formula guard fires.
+mkdir -p "$DIR/=guard"
+printf 'guard payload\n' > "$DIR/=guard/g1.txt"
+printf 'guard payload\n' > "$DIR/=guard/g2.txt"
+
+# The folder is passed relatively so the scanFolder cell itself begins with
+# "="; an absolute path would begin with a drive letter and need no guard.
+set +e
+(cd "$DIR" && "$ABS_BIN" --export report.csv "=guard" >/dev/null 2>&1)
+(cd "$DIR" && "$ABS_BIN" --export report.json --format json "=guard" >/dev/null 2>&1)
+set -e
+
+[ -f "$DIR/report.csv" ] || fail "CSV report was not written"
+[ -f "$DIR/report.json" ] || fail "JSON report was not written"
+head -1 "$DIR/report.csv" | grep -q "generatedAt,scanFolder" || fail "CSV header missing"
+grep -q "\"'=" "$DIR/report.csv" || fail "CSV formula guard did not fire"
+grep -q "twintidy.duplicate-report/v1" "$DIR/report.json" || fail "JSON schema missing"
+grep -q '"groupCount": 1' "$DIR/report.json" || fail "JSON group count wrong"
+# A staging file must never survive a successful write.
+[ -f "$DIR/report.csv.tmp" ] && fail "staging file left behind"
+
+set +e
+"$ABS_BIN" --format xml "$DIR" >/dev/null 2>&1
+BADFORMAT=$?
+set -e
+[ "$BADFORMAT" -eq 2 ] || fail "expected exit 2 for an unsupported format, got $BADFORMAT"
+
 # --- invocation errors ---------------------------------------------------
 set +e
 "$ABS_BIN" >/dev/null 2>&1
