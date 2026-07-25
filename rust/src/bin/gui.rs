@@ -37,19 +37,21 @@ mod windows_gui {
         ScanError, ScanResult, Stage, SurfaceReport,
     };
 
-    use windows_sys::core::{w, PCWSTR};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::core::{w, GUID, PCWSTR};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateFontW, DeleteObject, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, ScreenToClient,
         UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET,
-        DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HFONT, LOGPIXELSX, OUT_DEFAULT_PRECIS,
+        DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBITMAP, HFONT, LOGPIXELSX, OUT_DEFAULT_PRECIS,
     };
     use windows_sys::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-    use windows_sys::Win32::System::SystemServices::{SS_PATHELLIPSIS, SS_RIGHT};
+    use windows_sys::Win32::System::SystemServices::{
+        SS_BITMAP, SS_CENTERIMAGE, SS_PATHELLIPSIS, SS_RIGHT,
+    };
     use windows_sys::Win32::UI::Controls::Dialogs::{
         GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
@@ -60,13 +62,13 @@ mod windows_gui {
         LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE,
         LVM_SETITEMCOUNT, LVNI_SELECTED, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVS_EX_CHECKBOXES,
         LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-        NMHDR, NMLVDISPINFOW, NM_CLICK, PBM_SETMARQUEE, PBM_SETPOS, PBM_SETRANGE32, PBS_MARQUEE,
-        WC_LISTVIEWW,
+        NMHDR, NMLISTVIEW, NMLVDISPINFOW, NM_CLICK, PBM_SETMARQUEE, PBM_SETPOS, PBM_SETRANGE32,
+        PBS_MARQUEE, WC_LISTVIEWW,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::Shell::{
-        SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, BIF_NEWDIALOGSTYLE,
-        BIF_RETURNONLYFSDIRS, BROWSEINFOW,
+        SHBrowseForFolderW, SHCreateItemFromParsingName, SHGetPathFromIDListW, ShellExecuteW,
+        BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, SIIGBF_THUMBNAILONLY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -131,6 +133,9 @@ mod windows_gui {
         preview_safety_button: HWND,
         files_label: HWND,
         current_label: HWND,
+        preview_image: HWND,
+        preview_text: HWND,
+        preview_bitmap: HBITMAP,
         list: HWND,
         progress: HWND,
         status: HWND,
@@ -179,6 +184,165 @@ mod windows_gui {
 
     fn set_text(window: HWND, text: &str) {
         unsafe { SetWindowTextW(window, wide(text).as_ptr()) };
+    }
+
+    // ---------- preview ----------
+
+    /// The text preview is deliberately bounded: it exists to identify a
+    /// file, not to display it, and an unbounded read of an arbitrary file
+    /// would be both slow and pointless in a small pane.
+    const PREVIEW_TEXT_BYTES: usize = 4096;
+    const PREVIEW_THUMBNAIL_EDGE: i32 = 220;
+
+    /// `windows-sys` exposes raw bindings but no COM interfaces, so the
+    /// vtable for `IShellItemImageFactory` is declared here. The Go engine
+    /// declares the same vtable by hand, for the same reason.
+    #[repr(C)]
+    struct ShellItemImageFactoryVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_image: unsafe extern "system" fn(*mut c_void, SIZE, i32, *mut HBITMAP) -> i32,
+    }
+
+    #[repr(C)]
+    struct ShellItemImageFactory {
+        vtbl: *const ShellItemImageFactoryVtbl,
+    }
+
+    const IID_SHELL_ITEM_IMAGE_FACTORY: GUID = GUID {
+        data1: 0xbcc1_8b79,
+        data2: 0xba16,
+        data3: 0x442f,
+        data4: [0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b],
+    };
+
+    /// Ask the Windows Shell for an existing thumbnail of `path`.
+    ///
+    /// The Shell renders the image in its own process using the handler
+    /// already registered for that file type; this application never parses,
+    /// decodes, or executes the file's contents. `SIIGBF_THUMBNAILONLY`
+    /// refuses a generic type icon, so an empty pane honestly signals "no
+    /// thumbnail" rather than showing a placeholder that looks like content.
+    unsafe fn load_shell_thumbnail(path: &std::path::Path, edge: i32) -> Option<HBITMAP> {
+        let wide_path = wide(&path.to_string_lossy());
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        let hr = SHCreateItemFromParsingName(
+            wide_path.as_ptr(),
+            std::ptr::null_mut(),
+            &IID_SHELL_ITEM_IMAGE_FACTORY,
+            &mut factory,
+        );
+        if hr < 0 || factory.is_null() {
+            return None;
+        }
+
+        let object = factory as *mut ShellItemImageFactory;
+        let vtbl = (*object).vtbl;
+        let mut bitmap: HBITMAP = std::ptr::null_mut();
+        let size = SIZE { cx: edge, cy: edge };
+        let hr = ((*vtbl).get_image)(factory, size, SIIGBF_THUMBNAILONLY, &mut bitmap);
+        ((*vtbl).release)(factory);
+
+        if hr < 0 || bitmap.is_null() {
+            None
+        } else {
+            Some(bitmap)
+        }
+    }
+
+    /// Read a bounded prefix of a file and render it as text. Bytes are shown
+    /// as-is with control characters neutralized; nothing is interpreted as
+    /// markup, script, or a document format. Binary content is refused
+    /// outright rather than displayed as mojibake.
+    fn load_text_preview(path: &std::path::Path) -> Option<String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut raw = vec![0u8; PREVIEW_TEXT_BYTES];
+        let read = file.read(&mut raw).ok()?;
+        if read == 0 {
+            return None;
+        }
+        raw.truncate(read);
+        if raw.contains(&0) {
+            return None; // a NUL byte means this is not text
+        }
+        let cleaned: Vec<u8> = raw
+            .into_iter()
+            .map(|byte| {
+                if byte < 0x20 && byte != b'\r' && byte != b'\n' && byte != b'\t' {
+                    b'.'
+                } else {
+                    byte
+                }
+            })
+            .collect();
+        Some(String::from_utf8_lossy(&cleaned).into_owned())
+    }
+
+    unsafe fn clear_preview_bitmap() {
+        let state = app();
+        if !state.preview_bitmap.is_null() {
+            SendMessageW(state.preview_image, STM_SETIMAGE, IMAGE_BITMAP as usize, 0);
+            DeleteObject(state.preview_bitmap);
+            state.preview_bitmap = std::ptr::null_mut();
+        }
+    }
+
+    /// Refresh the preview pane for the currently focused row.
+    unsafe fn update_preview() {
+        clear_preview_bitmap();
+        let state = app();
+        let index = SendMessageW(
+            state.list,
+            LVM_GETNEXTITEM,
+            usize::MAX,
+            LVNI_SELECTED as isize,
+        );
+        let Some(row) = usize::try_from(index).ok().and_then(|i| state.rows.get(i)) else {
+            set_text(
+                state.preview_text,
+                "Select a row to see its details.\r\n\r\n\
+                 Thumbnails are produced by Windows Explorer's own preview handlers. \
+                 This window never parses or renders file contents.",
+            );
+            return;
+        };
+
+        // Details first: they are always available, even when neither a
+        // thumbnail nor a text preview can be produced.
+        let details = format!(
+            "{}\r\n\r\nFolder:    {}\r\nSize:      {} ({} bytes)\r\nType:      {}\r\n\
+             Modified:  {}\r\nGroup:     {}\r\nSHA-256:   {}...\r\n",
+            from_wide(&row.name),
+            from_wide(&row.folder),
+            format_bytes(row.size),
+            row.size,
+            from_wide(&row.kind),
+            format_timestamp(row.modified_at),
+            row.group,
+            from_wide(&row.hash),
+        );
+        let path = row.full_path.clone();
+
+        if let Some(bitmap) = load_shell_thumbnail(&path, scaled(PREVIEW_THUMBNAIL_EDGE)) {
+            app().preview_bitmap = bitmap;
+            SendMessageW(
+                app().preview_image,
+                STM_SETIMAGE,
+                IMAGE_BITMAP as usize,
+                bitmap as isize,
+            );
+        }
+
+        let body = match load_text_preview(&path) {
+            Some(text) => {
+                format!("{details}\r\n--- first {PREVIEW_TEXT_BYTES} bytes ---\r\n{text}")
+            }
+            None => details,
+        };
+        set_text(app().preview_text, &body);
     }
 
     /// Scale a 96-DPI design metric to the current display.
@@ -438,6 +602,20 @@ mod windows_gui {
             ID_LIST,
             WS_EX_CLIENTEDGE,
         );
+        state.preview_image = child(
+            w!("STATIC"),
+            std::ptr::null(),
+            SS_BITMAP | SS_CENTERIMAGE,
+            0,
+            WS_EX_CLIENTEDGE,
+        );
+        state.preview_text = child(
+            w!("EDIT"),
+            std::ptr::null(),
+            WS_VSCROLL | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
+            0,
+            WS_EX_CLIENTEDGE,
+        );
         state.status = child(
             w!("STATIC"),
             w!("Select a folder, run a surface scan, choose file types, then find duplicates. This window never changes your files."),
@@ -493,9 +671,13 @@ mod windows_gui {
     // ---------- state ----------
 
     unsafe fn clear_result() {
+        clear_preview_bitmap();
         let state = app();
         state.rows.clear();
         state.result = None;
+        if !state.preview_text.is_null() {
+            set_text(state.preview_text, "");
+        }
         SendMessageW(state.list, LVM_SETITEMCOUNT, 0, 0);
         InvalidateRect(state.list, std::ptr::null(), 1);
     }
@@ -959,13 +1141,17 @@ mod windows_gui {
         MessageBoxW(
             app().main,
             w!(
-                "This port does not open, render, or preview the contents of \
-                scanned files.\r\n\r\n\
-                Files are read only to compute their size and hash, and to \
-                compare candidates byte for byte. Nothing scanned is parsed, \
-                executed, or loaded into a viewer.\r\n\r\n\
-                Use Show In Explorer, then open a file with an application you \
-                trust if you need to inspect its contents."
+                "This window never parses, decodes, or executes a scanned file.\r\n\r\n\
+                Thumbnails come from Windows Explorer's own preview handlers, which \
+                render in the Shell's process, not this one. Only an existing \
+                thumbnail is requested; a generic type icon is refused, so an empty \
+                box means no thumbnail was available.\r\n\r\n\
+                The text preview shows the first 4096 bytes of a file as plain text \
+                with control characters neutralized, and is skipped entirely for \
+                binary content. Nothing is interpreted as markup, script, or a \
+                document format.\r\n\r\n\
+                Use Show In Explorer, then open a file with an application you trust \
+                if you need to inspect its full contents."
             ),
             w!("Preview Safety"),
             MB_OK | MB_ICONINFORMATION,
@@ -1342,7 +1528,21 @@ mod windows_gui {
         y += line + margin;
         let status_height = scaled(38);
         let list_height = (height - y - status_height - margin).max(scaled(60));
-        MoveWindow(state.list, margin, y, width - margin * 2, list_height, 1);
+        // Results area splits into the table and a preview pane.
+        let preview_width = scaled(300).min(width / 3);
+        let list_width = (width - margin * 3 - preview_width).max(scaled(200));
+        MoveWindow(state.list, margin, y, list_width, list_height, 1);
+        let preview_x = margin * 2 + list_width;
+        let thumb = scaled(PREVIEW_THUMBNAIL_EDGE).min(list_height / 2);
+        MoveWindow(state.preview_image, preview_x, y, preview_width, thumb, 1);
+        MoveWindow(
+            state.preview_text,
+            preview_x,
+            y + thumb + scaled(6),
+            preview_width,
+            list_height - thumb - scaled(6),
+            1,
+        );
         MoveWindow(
             state.status,
             margin,
@@ -1423,6 +1623,10 @@ mod windows_gui {
                         0
                     }
                     LVN_ITEMCHANGED => {
+                        let changed = lparam as *const NMLISTVIEW;
+                        if (*changed).uChanged & LVIF_STATE != 0 {
+                            update_preview();
+                        }
                         update_controls();
                         0
                     }
@@ -1453,6 +1657,7 @@ mod windows_gui {
             }
             WM_DESTROY => {
                 save_settings();
+                clear_preview_bitmap();
                 let state = app();
                 if !state.font.is_null() {
                     DeleteObject(state.font);
