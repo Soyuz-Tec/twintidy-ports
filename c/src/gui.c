@@ -17,6 +17,7 @@
 
 #include "report.h"
 #include "scanner.h"
+#include "settings.h"
 
 /* windows.h must precede the Win32 sub-headers: they depend on its types. */
 #include <windows.h>
@@ -39,6 +40,10 @@
 #define ID_CLEAR_SELECT  1008
 #define ID_EXPORT        1009
 #define ID_EXPLORER      1010
+#define ID_CLEAR_RESULTS 1011
+#define ID_RESET         1012
+#define ID_ABOUT         1013
+#define ID_PREVIEW_SAFETY 1014
 #define ID_CATEGORY_BASE 1100
 
 #define WM_APP_PROGRESS (WM_APP + 1)
@@ -54,6 +59,8 @@ typedef struct {
     int checked;
     wchar_t *name;
     wchar_t *folder;
+    wchar_t *type;   /* category label */
+    wchar_t *hash;   /* abbreviated SHA-256 of the group */
 } row;
 
 typedef struct {
@@ -66,7 +73,9 @@ typedef struct {
     HWND main, select_button, surface_button, find_button, cancel_button;
     HWND keep_newest_button, keep_oldest_button, clear_select_button;
     HWND export_button, explorer_button;
+    HWND clear_results_button, reset_button, about_button, preview_safety_button;
     HWND list, progress, status, path_label, stage_label, elapsed_label, focus_label;
+    HWND files_label, current_label;
     HWND category_checks[TD_CATEGORY_COUNT];
     HFONT font;
 
@@ -85,6 +94,9 @@ typedef struct {
     volatile LONG cancel_requested;
     volatile LONG scanning;
     ULONGLONG started_at;
+
+    char settings_path[512];
+    int settings_loaded;
 
     /* Screen DPI. The process declares itself DPI-aware, so Windows does not
      * scale it; every layout metric below is expressed at 96 DPI and scaled
@@ -177,6 +189,8 @@ static void free_rows(void) {
     for (size_t i = 0; i < app.row_count; i++) {
         free(app.rows[i].name);
         free(app.rows[i].folder);
+        free(app.rows[i].type);
+        free(app.rows[i].hash);
     }
     free(app.rows);
     app.rows = NULL;
@@ -243,6 +257,19 @@ static void build_rows(void) {
             app.rows[index].size = file->size;
             app.rows[index].modified_at = file->modified_at;
             app.rows[index].checked = 0;
+            app.rows[index].type = widen(td_category_label(file->category));
+            /* Show a short hash prefix: the full 64 characters are in the
+             * exported report, but a column that wide is unreadable. */
+            wchar_t short_hash[17];
+            wchar_t *full_hash = widen(app.result.groups[g].hash);
+            if (full_hash != NULL) {
+                wcsncpy(short_hash, full_hash, 16);
+                short_hash[16] = L'\0';
+                free(full_hash);
+            } else {
+                short_hash[0] = L'\0';
+            }
+            app.rows[index].hash = _wcsdup(short_hash);
             free(full);
             index++;
         }
@@ -379,6 +406,9 @@ static void update_controls(void) {
     EnableWindow(app.export_button, !busy && has_rows);
     EnableWindow(app.explorer_button,
                  !busy && ListView_GetSelectedCount(app.list) > 0);
+    EnableWindow(app.clear_results_button, !busy && has_rows);
+    EnableWindow(app.reset_button, !busy && (app.has_folder || app.has_surface));
+    /* About and Preview Safety are always available: they only show text. */
 }
 
 /* Label each category checkbox with the count found by the surface scan, so
@@ -455,7 +485,12 @@ static void end_operation(void) {
 }
 
 static void start_surface_scan(void) {
-    if (!app.has_folder || InterlockedCompareExchange(&app.scanning, 0, 0) != 0) {
+    if (InterlockedCompareExchange(&app.scanning, 0, 0) != 0) {
+        return;
+    }
+    if (!app.has_folder) {
+        MessageBoxW(app.main, L"Choose a folder before scanning.", L"Select Folder",
+                    MB_OK | MB_ICONINFORMATION);
         return;
     }
     clear_surface();
@@ -489,6 +524,20 @@ static void start_duplicate_scan(void) {
     *options = td_default_options();
     collect_selected_categories(options);
 
+    int any_selected = 0;
+    for (size_t i = 0; i < TD_CATEGORY_COUNT; i++) {
+        if (options->categories[i]) {
+            any_selected = 1;
+            break;
+        }
+    }
+    if (!any_selected) {
+        free(options);
+        MessageBoxW(app.main, L"Select at least one file type before finding duplicates.",
+                    L"Select File Types", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
     begin_operation(L"Finding duplicates in the selected file types...");
     app.thread = CreateThread(NULL, 0, duplicate_thread, options, 0, NULL);
     if (app.thread == NULL) {
@@ -521,6 +570,114 @@ static void show_in_explorer(void) {
     _snwprintf(argument, length, L"/select,\"%s\\%s\"", entry->folder, entry->name);
     ShellExecuteW(app.main, L"open", L"explorer.exe", argument, NULL, SW_SHOWNORMAL);
     free(argument);
+}
+
+/* Discard duplicate results but keep the surface inventory, so the user can
+ * adjust the file-type focus and search again without rescanning. */
+static void clear_results_action(void) {
+    clear_result();
+    SetWindowTextW(app.stage_label, L"");
+    set_status(L"Results cleared. The surface inventory is still available; "
+               L"adjust the file-type focus and choose Find Duplicates.");
+    update_controls();
+}
+
+/* Return to the initial state, discarding folder, inventory, and results. */
+static void reset_action(void) {
+    clear_surface();
+    app.has_folder = 0;
+    app.folder[0] = L'\0';
+    SetWindowTextW(app.path_label, L"No folder selected.");
+    SetWindowTextW(app.stage_label, L"");
+    SetWindowTextW(app.elapsed_label, L"");
+    SetWindowTextW(app.files_label, L"");
+    SetWindowTextW(app.current_label, L"");
+    refresh_category_labels();
+    set_status(L"Reset. Select a folder to begin.");
+    update_controls();
+}
+
+/* Persist window placement and the last scanned folder. Failures are
+ * ignored: preferences are a convenience, never a precondition. */
+static void save_settings(void) {
+    if (!app.settings_loaded) {
+        return;
+    }
+    td_settings value = td_settings_defaults();
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof placement;
+    if (GetWindowPlacement(app.main, &placement)) {
+        value.x = placement.rcNormalPosition.left;
+        value.y = placement.rcNormalPosition.top;
+        value.width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+        value.height = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+        value.maximized = placement.showCmd == SW_SHOWMAXIMIZED;
+    }
+    if (app.has_folder) {
+        narrow_into(app.folder, value.last_folder, sizeof value.last_folder);
+    }
+    td_settings_save(app.settings_path, &value);
+}
+
+/* Restore placement, clamping to the virtual screen so a window saved on a
+ * monitor that is no longer attached cannot open off-screen. */
+static void apply_settings(const td_settings *value) {
+    if (value->width > 0 && value->height > 0) {
+        int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int screen_right = screen_left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int screen_bottom = screen_top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (value->x < screen_right && value->y < screen_bottom &&
+            value->x + value->width > screen_left &&
+            value->y + value->height > screen_top) {
+            MoveWindow(app.main, value->x, value->y, value->width, value->height, TRUE);
+        }
+    }
+    if (value->maximized) {
+        ShowWindow(app.main, SW_SHOWMAXIMIZED);
+    }
+    if (value->last_folder[0] != '\0') {
+        wchar_t *wide = widen(value->last_folder);
+        if (wide != NULL) {
+            /* Only offer the folder if it still exists. */
+            DWORD attributes = GetFileAttributesW(wide);
+            if (attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                wcsncpy(app.folder, wide, MAX_PATH - 1);
+                app.folder[MAX_PATH - 1] = L'\0';
+                app.has_folder = 1;
+                SetWindowTextW(app.path_label, app.folder);
+                set_status(L"Restored your last folder. Choose Surface Scan to inventory user files.");
+            }
+            free(wide);
+        }
+    }
+}
+
+static void show_about(void) {
+    MessageBoxW(app.main,
+                L"TwinTidy (C port)\r\n\r\n"
+                L"A C11 port of the duplicate-detection core of TwinTidy, the "
+                L"safety-first Windows duplicate-file finder by Kayilan Inc.\r\n\r\n"
+                L"This window is read-only: it finds and reports duplicates and "
+                L"never deletes, moves, or modifies a file. Checkbox selection "
+                L"plans cleanup for export; it does not perform it.\r\n\r\n"
+                L"Protected system folders, dependency trees, build output, and "
+                L"executable file types are excluded from every scan.\r\n\r\n"
+                L"MIT licensed. Copyright (c) 2026 Kayilan Inc.",
+                L"About TwinTidy", MB_OK | MB_ICONINFORMATION);
+}
+
+static void show_preview_safety(void) {
+    MessageBoxW(app.main,
+                L"This port does not open, render, or preview the contents of "
+                L"scanned files.\r\n\r\n"
+                L"Files are read only to compute their size and hash, and to "
+                L"compare candidates byte for byte. Nothing scanned is parsed, "
+                L"executed, or loaded into a viewer.\r\n\r\n"
+                L"Use Show In Explorer, then open a file with an application you "
+                L"trust if you need to inspect its contents.",
+                L"Preview Safety", MB_OK | MB_ICONINFORMATION);
 }
 
 static void export_report(void) {
@@ -567,6 +724,14 @@ static void on_progress(progress_message *message) {
         return;
     }
     SetWindowTextW(app.stage_label, message->stage);
+    wchar_t counts[64];
+    if (message->total > 0) {
+        _snwprintf(counts, sizeof counts / sizeof *counts, L"%zu / %zu files",
+                   message->done, message->total);
+    } else {
+        _snwprintf(counts, sizeof counts / sizeof *counts, L"%zu files", message->done);
+    }
+    SetWindowTextW(app.files_label, counts);
     if (message->total > 0) {
         SendMessageW(app.progress, PBM_SETMARQUEE, FALSE, 0);
         SetWindowLongPtrW(app.progress, GWL_STYLE,
@@ -609,6 +774,9 @@ static void on_surface_finished(int status, td_surface *surface) {
                app.surface.count, total, app.surface.directories_scanned,
                app.surface.skipped_system_items);
     set_status(text);
+    wchar_t counts[64];
+    _snwprintf(counts, sizeof counts / sizeof *counts, L"%zu files", app.surface.count);
+    SetWindowTextW(app.files_label, counts);
     update_controls();
 }
 
@@ -669,22 +837,32 @@ static void on_get_display_info(NMLVDISPINFOW *info) {
         return;
     }
     switch (info->item.iSubItem) {
-    case 0:
-        _snwprintf(buffer, sizeof buffer / sizeof *buffer, L"%d", entry->group);
+    case 0: /* No. — 1-based row number, matching the exported report order */
+        _snwprintf(buffer, sizeof buffer / sizeof *buffer, L"%d", index + 1);
         info->item.pszText = buffer;
         break;
     case 1:
-        format_bytes(entry->size, buffer, sizeof buffer / sizeof *buffer);
+        _snwprintf(buffer, sizeof buffer / sizeof *buffer, L"%d", entry->group);
         info->item.pszText = buffer;
         break;
     case 2:
         info->item.pszText = entry->name ? entry->name : L"";
         break;
     case 3:
-        format_local_time(entry->modified_at, buffer, sizeof buffer / sizeof *buffer);
+        format_bytes(entry->size, buffer, sizeof buffer / sizeof *buffer);
         info->item.pszText = buffer;
         break;
     case 4:
+        info->item.pszText = entry->type ? entry->type : L"";
+        break;
+    case 5:
+        format_local_time(entry->modified_at, buffer, sizeof buffer / sizeof *buffer);
+        info->item.pszText = buffer;
+        break;
+    case 6:
+        info->item.pszText = entry->hash ? entry->hash : L"";
+        break;
+    case 7:
         info->item.pszText = entry->folder ? entry->folder : L"";
         break;
     default:
@@ -763,6 +941,15 @@ static void layout(int width, int height) {
     MoveWindow(app.export_button, margin * 4 + button * 3, y, button, line, TRUE);
     MoveWindow(app.explorer_button, margin * 5 + button * 4, y, button + scaled(20), line, TRUE);
 
+    y += line + scaled(8);
+    MoveWindow(app.clear_results_button, margin, y, button, line, TRUE);
+    MoveWindow(app.reset_button, margin * 2 + button, y, button, line, TRUE);
+    MoveWindow(app.preview_safety_button, margin * 3 + button * 2, y, button, line, TRUE);
+    MoveWindow(app.about_button, margin * 4 + button * 3, y, button, line, TRUE);
+    MoveWindow(app.files_label, margin * 5 + button * 4, y + scaled(8), scaled(140), scaled(20), TRUE);
+    MoveWindow(app.current_label, margin * 5 + button * 4 + scaled(150), y + scaled(8),
+               width - (margin * 6 + button * 4 + scaled(150)), scaled(20), TRUE);
+
     y += line + margin;
     const int status_height = scaled(38);
     int list_height = height - y - status_height - margin;
@@ -800,6 +987,12 @@ static void create_controls(HWND window) {
         {&app.clear_select_button, L"BUTTON", L"Clear Selection", BS_PUSHBUTTON, ID_CLEAR_SELECT},
         {&app.export_button, L"BUTTON", L"Export Report", BS_PUSHBUTTON, ID_EXPORT},
         {&app.explorer_button, L"BUTTON", L"Show In Explorer", BS_PUSHBUTTON, ID_EXPLORER},
+        {&app.clear_results_button, L"BUTTON", L"Clear Results", BS_PUSHBUTTON, ID_CLEAR_RESULTS},
+        {&app.reset_button, L"BUTTON", L"Reset", BS_PUSHBUTTON, ID_RESET},
+        {&app.preview_safety_button, L"BUTTON", L"Preview Safety", BS_PUSHBUTTON, ID_PREVIEW_SAFETY},
+        {&app.about_button, L"BUTTON", L"About", BS_PUSHBUTTON, ID_ABOUT},
+        {&app.files_label, L"STATIC", L"", 0, 0},
+        {&app.current_label, L"STATIC", L"", SS_PATHELLIPSIS, 0},
     };
     for (size_t i = 0; i < sizeof controls / sizeof *controls; i++) {
         *controls[i].target = CreateWindowExW(
@@ -841,9 +1034,10 @@ static void create_controls(HWND window) {
         const wchar_t *title;
         int width;
     } columns[] = {
-        {L"Group", 80}, {L"Size", 90}, {L"File", 260}, {L"Modified", 140}, {L"Folder", 420},
+        {L"No.", 55},   {L"Group", 62},    {L"Name", 230}, {L"Size", 90},
+        {L"Type", 95},  {L"Modified", 140}, {L"Hash", 130}, {L"Folder", 380},
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < (int)(sizeof columns / sizeof *columns); i++) {
         column.iSubItem = i;
         column.pszText = (LPWSTR)columns[i].title;
         column.cx = scaled(columns[i].width);
@@ -858,6 +1052,11 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
         app.main = window;
         app.dpi = display_dpi(window);
         create_controls(window);
+        if (td_settings_path(app.settings_path, sizeof app.settings_path)) {
+            app.settings_loaded = 1;
+            td_settings stored = td_settings_load(app.settings_path);
+            apply_settings(&stored);
+        }
         update_controls();
         return 0;
 
@@ -914,6 +1113,18 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
         case ID_EXPLORER:
             show_in_explorer();
             return 0;
+        case ID_CLEAR_RESULTS:
+            clear_results_action();
+            return 0;
+        case ID_RESET:
+            reset_action();
+            return 0;
+        case ID_ABOUT:
+            show_about();
+            return 0;
+        case ID_PREVIEW_SAFETY:
+            show_preview_safety();
+            return 0;
         default:
             break;
         }
@@ -962,6 +1173,7 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
         return 0;
 
     case WM_DESTROY:
+        save_settings();
         clear_surface();
         if (app.font != NULL) {
             DeleteObject(app.font);
