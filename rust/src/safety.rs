@@ -217,39 +217,53 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn protected_directories_are_skipped_at_any_depth() {
-        assert!(should_skip_directory(&PathBuf::from(
-            r"C:\code\project\node_modules"
-        )));
-        assert!(should_skip_directory(&PathBuf::from(r"C:\code\.git\refs")));
-        assert!(!should_skip_directory(&PathBuf::from(
-            r"C:\code\project\src"
-        )));
+    /// Build a path from segments using the platform separator, so these
+    /// tests exercise real component splitting on Windows and on Linux.
+    /// A literal backslash is only a separator on Windows.
+    fn path_of(segments: &[&str]) -> PathBuf {
+        segments.iter().collect()
     }
 
     #[test]
+    fn protected_directories_are_skipped_at_any_depth() {
+        assert!(should_skip_directory(&path_of(&[
+            "code",
+            "project",
+            "node_modules"
+        ])));
+        assert!(should_skip_directory(&path_of(&["code", ".git", "refs"])));
+        assert!(!should_skip_directory(&path_of(&[
+            "code", "project", "src"
+        ])));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn drive_prefix_is_not_a_segment() {
-        // "c:" must not be mistaken for a protected name.
+        // "c:" must not be mistaken for a protected name. Drive prefixes only
+        // exist on Windows, so this case is Windows-only by nature.
         assert!(!should_skip_directory(&PathBuf::from(r"C:\Users\example")));
     }
 
     #[test]
     fn protected_extensions_are_never_candidates() {
-        assert!(!is_user_created_file(&PathBuf::from(
-            r"C:\Users\a\setup.exe"
-        )));
-        assert!(!is_user_created_file(&PathBuf::from(r"C:\Users\a\lib.DLL")));
-        assert!(is_user_created_file(&PathBuf::from(
-            r"C:\Users\a\notes.txt"
-        )));
+        assert!(!is_user_created_file(&path_of(&[
+            "users",
+            "a",
+            "setup.exe"
+        ])));
+        assert!(!is_user_created_file(&path_of(&["users", "a", "lib.DLL"])));
+        assert!(is_user_created_file(&path_of(&["users", "a", "notes.txt"])));
     }
 
     #[test]
     fn files_inherit_directory_protection() {
-        assert!(!is_user_created_file(&PathBuf::from(
-            r"C:\code\node_modules\pkg\index.js"
-        )));
+        assert!(!is_user_created_file(&path_of(&[
+            "code",
+            "node_modules",
+            "pkg",
+            "index.js"
+        ])));
     }
 
     #[test]

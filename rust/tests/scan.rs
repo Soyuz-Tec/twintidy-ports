@@ -213,11 +213,8 @@ fn cancellation_stops_the_scan() {
 fn protected_root_is_refused() {
     // A root whose own path is protected must be rejected outright rather
     // than silently returning an empty result.
-    let outcome = surface_scan(
-        Path::new(r"C:\some\node_modules"),
-        &Options::default(),
-        |_, _, _| Flow::Continue,
-    );
+    let protected: PathBuf = ["some", "node_modules"].iter().collect();
+    let outcome = surface_scan(&protected, &Options::default(), |_, _, _| Flow::Continue);
     assert_eq!(outcome.unwrap_err(), ScanError::ProtectedRoot);
 }
 
