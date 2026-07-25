@@ -6,14 +6,25 @@ Each port ships a **command-line scanner** and a **native Windows GUI**. Both ar
 
 ## Detection strategy
 
-Both ports use the same pipeline as the Go engine:
+Both ports run the same staged pipeline as the Go engine:
 
-1. Walk the tree, collecting regular files (symlinks skipped, so cycles are impossible).
-2. Group by exact size — files of different sizes can never be duplicates.
-3. Within a size group, hash each file with streamed FNV-1a 64.
-4. Within a hash group, confirm with a full byte-for-byte comparison, so a hash collision can never produce a false duplicate.
+1. **Surface scan** — walk the tree collecting user files, with per-category statistics. Symlinks are skipped, so cycles are impossible.
+2. **Size mapping** — files of different sizes can never be duplicates.
+3. **Boundary hash** — a cheap FNV-1a over each file's head and tail rejects most same-size candidates without reading them whole.
+4. **Full hash** — SHA-256 over the complete file, matching the group identifiers the Go engine publishes.
+5. **Confirmation** — a full byte-for-byte comparison, so a hash collision can never produce a false duplicate.
 
 Unreadable files are counted and skipped, never guessed at.
+
+## Safety model
+
+Both ports apply the same file-selection policy as TwinTidy, so a scan stays on user-created content:
+
+- **Protected directories** are never traversed at any depth — system and application folders (`Windows`, `AppData`, `ProgramData`), version-control internals (`.git`, `.svn`), dependency trees (`node_modules`, `site-packages`, `.venv`), and build output (`target`, `build`, `dist`, `bin`, `obj`).
+- **Protected extensions** are never duplicate candidates — executables, libraries, drivers, installers, and shortcuts.
+- A scan root that is itself protected is refused rather than silently returning nothing.
+
+Without this policy a scan of a development folder reports thousands of build artefacts a user must not act on.
 
 ## Layout
 
@@ -32,9 +43,18 @@ Command line, on either port:
 twintidy <folder>
 ```
 
-It prints each duplicate group with per-file paths and a keep-one-copy reclaimable-bytes estimate. Exit codes: `0` success, `2` bad invocation or scan failure.
+Options: `--surface` (inventory only), `--category NAME` (repeatable), `--min-size BYTES`, `--exclude PATH`, `--exclude-ext EXT`, `--export PATH`, `--format csv|json`.
 
-The GUI opens a window where you select a folder, run a scan with live progress and a working Cancel, and review the results in a sortable table (group, size, file, folder). It offers no destructive action.
+It prints each duplicate group with its SHA-256, per-file paths, and a keep-one-copy reclaimable-bytes estimate. Exit codes: `0` no duplicates, `1` duplicates found, `2` bad invocation or scan failure.
+
+The GUI follows the same two-phase workflow as the Go application:
+
+1. **Select Folder**, then **Surface Scan** builds an inventory of user files.
+2. The **file-type focus** checkboxes fill in with the per-category counts found; untick what you do not care about.
+3. **Find Duplicates** hashes only the selected types, with live stage, elapsed time, and a working Cancel.
+4. Review results with row checkboxes, **Keep Newest** / **Keep Oldest** / **Clear Selection**, **Show In Explorer**, and **Export Report** (CSV or JSON).
+
+Keep Newest and Keep Oldest always leave one copy of every group unchecked. Selection is planning only: neither window offers any action that deletes, moves, or modifies a file.
 
 ## Building
 
@@ -57,7 +77,7 @@ The Rust library and CLI use the **standard library only**. The Rust GUI additio
 ## Known limitations
 
 - The C GUI converts engine paths for display using the active code page, so paths containing characters outside it may render with substitutions. This affects display only, never which files the engine compares.
-- Neither port implements TwinTidy's safety model. Pointed at a development folder they will report duplicates inside `node_modules`, `.git`, and build output that the real application deliberately skips.
+- Neither port implements TwinTidy's Windows file-identity capture or hardlink consolidation, so they can plan cleanup but never perform it.
 
 ## License
 
